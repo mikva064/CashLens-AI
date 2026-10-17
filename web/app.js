@@ -42,7 +42,7 @@ function upload(file) {
   xhr.onload = () => {
     $("progress").hidden = true;
     const body = safeJson(xhr.responseText);
-    if (xhr.status !== 202) {
+    if (xhr.status !== 200) {
       $("status").textContent = `Ошибка: ${body?.detail || xhr.status}`;
       $("submit").disabled = false;
       return;
@@ -66,7 +66,7 @@ function poll(jobId) {
     const res = await fetch(`/web/jobs/${jobId}`);
     const job = await res.json();
     const secs = Math.round((Date.now() - started) / 1000);
-    if (job.status === "queued") {
+    if (job.stage === "queued") {
       $("status").textContent = `В очереди (перед вами: ${job.queue_position}) · ${secs} с`;
     } else if (job.status === "processing") {
       $("status").textContent = `Анализ видео… ${secs} с`;
@@ -85,6 +85,11 @@ function poll(jobId) {
   pollTimer = setInterval(tick, 2000);
 }
 
+function fmt(sec) {
+  const s = Math.floor(sec);
+  return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}.${Math.round((sec - s) * 10)}`;
+}
+
 function seek(sec) {
   const player = $("player");
   player.currentTime = sec;
@@ -93,36 +98,41 @@ function seek(sec) {
 
 function render(job) {
   const ok = job.verdict === "no_violation";
+  const items = job.violations;
   const verdict = $("verdict");
   verdict.className = `verdict ${ok ? "ok" : "bad"}`;
   verdict.textContent = ok
     ? "Нарушение не обнаружено"
-    : `Обнаружены признаки возможного нарушения: ${job.events.length}`;
+    : `Обнаружены признаки возможных нарушений: ${items.length}`;
 
   const player = $("player");
-  player.src = job.video_url || "";
+  // preview.mp4 может ещё конвертироваться — тогда пробуем исходный файл.
+  player.onerror = () => {
+    if (!player.src.endsWith(job.original_url)) player.src = job.original_url;
+  };
+  player.src = job.video_url;
 
   const timeline = $("timeline");
   timeline.replaceChildren();
   const duration = job.duration_sec || 1;
-  job.events.forEach((ev) => {
+  items.forEach((ev) => {
     const bar = document.createElement("span");
     bar.style.left = `${(ev.start_sec / duration) * 100}%`;
     bar.style.width = `${((ev.end_sec - ev.start_sec) / duration) * 100}%`;
-    bar.title = `${ev.timecode} — ${ev.type_title}`;
-    bar.onclick = () => seek(ev.start_sec);
+    bar.title = `${fmt(ev.timecode_sec)} — ${ev.type}`;
+    bar.onclick = () => seek(ev.timecode_sec);
     timeline.append(bar);
   });
 
   const list = $("events");
   list.replaceChildren();
   const tpl = $("event-tpl");
-  job.events.forEach((ev) => {
+  items.forEach((ev) => {
     const node = tpl.content.cloneNode(true);
     const tc = node.querySelector(".timecode");
-    tc.textContent = ev.timecode;
-    tc.onclick = () => seek(ev.start_sec);
-    node.querySelector(".type").textContent = ev.type_title;
+    tc.textContent = fmt(ev.timecode_sec);
+    tc.onclick = () => seek(ev.timecode_sec);
+    node.querySelector(".type").textContent = ev.type;
     if (ev.confidence != null) {
       node.querySelector(".confidence").textContent = `уверенность ${Math.round(ev.confidence * 100)}%`;
     }
@@ -132,10 +142,10 @@ function render(job) {
       const fig = document.createElement("figure");
       const img = document.createElement("img");
       img.src = f.url;
-      img.alt = `Кадр ${f.sec} с`;
+      img.alt = `Кадр ${f.timestamp_sec} с`;
       img.onclick = () => window.open(f.url, "_blank");
       const cap = document.createElement("figcaption");
-      cap.textContent = `${f.sec.toFixed(1)} с`;
+      cap.textContent = `${f.timestamp_sec.toFixed(1)} с`;
       fig.append(img, cap);
       frames.append(fig);
     });

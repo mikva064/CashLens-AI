@@ -42,13 +42,21 @@ def probe_duration(path: str | Path) -> Optional[float]:
 
 
 def to_browser_mp4(src: Path, dst: Path) -> bool:
-    """H.264 mp4 для встроенного плеера (.mov играет не во всех браузерах)."""
+    """H.264 mp4 для встроенного плеера (.mov играет не во всех браузерах).
+
+    Пишем во временный файл и переименовываем в конце, чтобы /media не отдал
+    недописанное видео.
+    """
+    tmp = dst.with_name(dst.stem + ".part.mp4")
     proc = _run(
         ["-y", "-i", str(src), "-c:v", "libx264", "-preset", "veryfast",
-         "-crf", "26", "-pix_fmt", "yuv420p", "-an", "-movflags", "+faststart", str(dst)],
+         "-crf", "26", "-pix_fmt", "yuv420p", "-an", "-movflags", "+faststart", str(tmp)],
         timeout=180,
     )
-    return proc.returncode == 0 and dst.exists()
+    if proc.returncode != 0 or not tmp.exists():
+        return False
+    tmp.replace(dst)
+    return True
 
 
 def extract_frame(src: Path, at_sec: float, dst: Path) -> bool:

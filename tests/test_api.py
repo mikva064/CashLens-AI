@@ -1,3 +1,4 @@
+import base64
 import os
 import subprocess
 import tempfile
@@ -66,16 +67,32 @@ def test_unknown_job(client):
 def test_full_flow(client, video):
     with open(video, "rb") as f:
         r = client.post("/api/v1/analyze", headers=KEY, files={"file": ("sample.mov", f)})
-    assert r.status_code == 202
+    assert r.status_code == 200
+    assert r.json()["status"] == "processing"
     job = _wait(client, r.json()["job_id"])
     assert job["status"] == "done", job
-    assert job["verdict"] in ("no_violation", "possible_violation")
-    assert (job["verdict"] == "possible_violation") == bool(job["events"])
-    for ev in job["events"]:
-        assert ev["rule"]["source"]
-        assert ev["evidence_frames"]
-        assert client.get(ev["evidence_frames"][0]["url"]).status_code == 200
-    assert client.get(job["video_url"]).status_code == 200
+    assert job["verdict"] in ("no_violation", "violation")
+    assert (job["verdict"] == "violation") == bool(job["violations"])
+
+
+def test_result_schema(client, video, monkeypatch):
+    """Схема ответа из ТЗ, раздел 10: violations[].type/timecode_sec/description/evidence_frames."""
+    monkeypatch.setenv("CASHLENS_MOCK_VERDICT", "violation")
+    with open(video, "rb") as f:
+        r = client.post("/api/v1/analyze", headers=KEY, files={"file": ("sample.mov", f)})
+    job = _wait(client, r.json()["job_id"])
+    assert job["verdict"] == "violation"
+    v = job["violations"][0]
+    assert isinstance(v["type"], str) and v["type"]
+    assert isinstance(v["timecode_sec"], float)
+    assert v["description"]
+    assert 1 <= len(v["evidence_frames"]) <= 3
+    first = v["evidence_frames"][0]
+    assert first["timestamp_sec"] == v["timecode_sec"]
+    assert base64.b64decode(first["image_base64"])[:2] == b"\xff\xd8"  # JPEG
+
+    web = client.get(f"/web/jobs/{job['job_id']}").json()
+    assert client.get(web["violations"][0]["evidence_frames"][0]["url"]).status_code == 200
 
 
 def test_db_not_served(client):

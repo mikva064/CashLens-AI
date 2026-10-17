@@ -15,10 +15,13 @@ def analyze_video(path: str, deadline_sec: float) -> dict:
     time.sleep(float(os.getenv("CASHLENS_MOCK_DELAY", "2")))
     duration = probe_duration(path) or 30.0
 
-    # Вердикт зависит от содержимого файла, чтобы проверять оба варианта интерфейса.
-    with open(path, "rb") as f:
-        digest = hashlib.md5(f.read(1 << 20)).digest()
-    if digest[0] % 2 == 0:
+    # CASHLENS_MOCK_VERDICT=violation|clean задаёт ответ явно; по умолчанию он зависит
+    # от содержимого файла, чтобы в интерфейсе можно было увидеть оба варианта.
+    mode = os.getenv("CASHLENS_MOCK_VERDICT", "auto")
+    if mode == "auto":
+        with open(path, "rb") as f:
+            mode = "violation" if hashlib.md5(f.read(1 << 20)).digest()[0] % 2 else "clean"
+    if mode == "clean":
         return {"events": []}
 
     key = round(duration * 0.5, 1)

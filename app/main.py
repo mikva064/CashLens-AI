@@ -1,3 +1,4 @@
+import base64
 import logging
 import secrets
 import time
@@ -59,42 +60,73 @@ async def _accept_upload(file: UploadFile) -> dict:
         raise HTTPException(status_code=422, detail="Файл не распознан как видео")
 
     db.create(job_id, file.filename or "video.mov")
-    return {"job_id": job_id, "status": "queued"}
+    return {"job_id": job_id, "status": "processing"}
 
 
-def _job_view(job: dict) -> dict:
-    view = {
-        "job_id": job["id"],
-        "status": job["status"],
-        "filename": job["filename"],
-        "created_at": job["created_at"],
-    }
-    if job["status"] == "queued":
+def _frames(job_id: str, frames: list[dict], as_base64: bool) -> list[dict]:
+    out = []
+    for f in frames:
+        item = {"timestamp_sec": f["timestamp_sec"]}
+        if as_base64:
+            path = JOBS_DIR / job_id / f["file"]
+            if not path.exists():
+                continue
+            item["image_base64"] = base64.b64encode(path.read_bytes()).decode("ascii")
+        else:
+            item["url"] = f"/media/{job_id}/{f['file']}"
+        out.append(item)
+    return out
+
+
+def _job_view(job: dict, as_base64: bool) -> dict:
+    """Ответ по схеме ТЗ (раздел 10); дополнительные поля схему не нарушают.
+
+    В ТЗ статусы только processing / done / failed, поэтому «в очереди» наружу
+    отдаётся как processing, а подробность — в поле stage.
+    """
+    status = job["status"]
+    view = {"job_id": job["id"], "status": "processing" if status == "queued" else status,
+            "stage": status}
+    if status == "queued":
         view["queue_position"] = db.queue_position(job["id"])
-    if job["status"] == "processing" and time.time() - job["created_at"] > JOB_TIMEOUT_SEC + 30:
-        view["status"] = "failed"
+    if status == "processing" and time.time() - job["created_at"] > JOB_TIMEOUT_SEC + 30:
+        view["status"] = view["stage"] = "failed"
         view["error"] = "Обработка не уложилась в лимит времени"
-    if job["status"] == "done":
-        view.update(job["result"])
+    if status == "done":
+        result = job["result"]
+        view["verdict"] = result["verdict"]
+        view["violations"] = [
+            {**v, "evidence_frames": _frames(job["id"], v["evidence_frames"], as_base64)}
+            for v in result["violations"]
+        ]
+        view["duration_sec"] = result["duration_sec"]
         view["processing_time_sec"] = round(job["finished_at"] - job["created_at"], 2)
-    if job["status"] == "failed":
+        view["timings"] = result.get("timings")
+        if not as_base64:
+            view["video_url"] = f"/media/{job['id']}/preview.mp4"
+            view["original_url"] = f"/media/{job['id']}/video.mov"
+    if status == "failed":
         view["error"] = job["error"]
     return view
 
 
+def _load(job_id: str) -> dict:
+    job = db.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    return job
+
+
 # ---------- Публичный API (по заданию) ----------
 
-@app.post("/api/v1/analyze", status_code=202, dependencies=[Depends(require_key)])
+@app.post("/api/v1/analyze", dependencies=[Depends(require_key)])
 async def analyze(file: UploadFile = File(...)):
     return await _accept_upload(file)
 
 
 @app.get("/api/v1/jobs/{job_id}", dependencies=[Depends(require_key)])
 def get_job(job_id: str):
-    job = db.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Задача не найдена")
-    return _job_view(job)
+    return _job_view(_load(job_id), as_base64=True)
 
 
 @app.get("/health")
@@ -104,7 +136,7 @@ def health():
 
 # ---------- Веб-интерфейс (без ключа в браузере) ----------
 
-@app.post("/web/analyze", status_code=202)
+@app.post("/web/analyze")
 async def web_analyze(file: UploadFile = File(...)):
     if not WEB_UPLOAD_ENABLED:
         raise HTTPException(status_code=403, detail="Загрузка через веб отключена")
@@ -113,7 +145,8 @@ async def web_analyze(file: UploadFile = File(...)):
 
 @app.get("/web/jobs/{job_id}")
 def web_job(job_id: str):
-    return get_job(job_id)
+    # Интерфейсу — ссылки на кадры вместо base64, чтобы опрос раз в 2 с был лёгким.
+    return _job_view(_load(job_id), as_base64=False)
 
 
 app.mount("/media", StaticFiles(directory=JOBS_DIR), name="media")

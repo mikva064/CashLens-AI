@@ -14,46 +14,45 @@ from app.config import JOBS_DIR, JOB_TIMEOUT_SEC
 
 log = logging.getLogger("cashlens.worker")
 
+# Значения вердикта — по схеме API из ТЗ (раздел 10).
 VERDICT_OK = "no_violation"
-VERDICT_SUSPECT = "possible_violation"
-
-
-def _timecode(sec: float) -> str:
-    sec = int(round(sec))
-    return f"{sec // 60:02d}:{sec % 60:02d}"
+VERDICT_VIOLATION = "violation"
 
 
 def _build_result(job_id: str, raw: dict, duration: float | None) -> dict:
     job_dir = JOBS_DIR / job_id
     src = job_dir / "video.mov"
-    events = []
+    violations = []
     for i, ev in enumerate(raw.get("events", []), start=1):
         start = float(ev["start_sec"])
         end = float(ev.get("end_sec", start))
-        key = float(ev.get("key_sec", (start + end) / 2))
-        # Кадры «до / во время / после» — последовательность действия, а не один снимок.
-        points = sorted({round(start, 2), round(key, 2), round(end, 2)})
+        key = round(float(ev.get("key_sec", (start + end) / 2)), 2)
+        # Первый кадр — ровно на таймкоде; затем «до» и «после» для последовательности действия.
+        points = [key] + [t for t in (round(start, 2), round(end, 2)) if abs(t - key) >= 0.5]
         frames = []
-        for j, t in enumerate(points, start=1):
+        for j, t in enumerate(points[:3], start=1):
             name = f"e{i}_{j}.jpg"
             if media.extract_frame(src, t, job_dir / name):
-                frames.append({"sec": t, "url": f"/media/{job_id}/{name}"})
+                frames.append({"timestamp_sec": t, "file": name})
         rule = rules.lookup(ev["type"])
-        events.append({
-            "type": ev["type"],
-            "type_title": rule["title"],
+        description = ev.get("description", "").strip()
+        if rule["requirement"]:
+            description = f"{description} Требование: {rule['requirement']} ({rule['source']})."
+        violations.append({
+            "type": rule["title"],
+            "type_id": ev["type"],
+            "timecode_sec": key,
             "start_sec": start,
             "end_sec": end,
-            "timecode": _timecode(key),
             "confidence": ev.get("confidence"),
-            "description": ev.get("description", ""),
+            "description": description,
             "evidence_frames": frames,
             "rule": {k: rule[k] for k in ("id", "title", "requirement", "source", "url", "verified")},
         })
     return {
-        "verdict": VERDICT_SUSPECT if events else VERDICT_OK,
+        "verdict": VERDICT_VIOLATION if violations else VERDICT_OK,
         "duration_sec": duration,
-        "events": events,
+        "violations": violations,
     }
 
 
@@ -67,16 +66,17 @@ def _process(job_id: str, analyze) -> None:
     if deadline <= 0:
         db.fail(job_id, "Превышено время ожидания в очереди")
         return
+    # mp4 для плеера нужен только интерфейсу — конвертируем параллельно, результат его не ждёт.
+    threading.Thread(target=media.to_browser_mp4, args=(src, job_dir / "preview.mp4"),
+                     daemon=True).start()
     duration = media.probe_duration(src)
     raw = analyze(str(src), deadline)
     result = _build_result(job_id, raw, duration)
-    media.to_browser_mp4(src, job_dir / "preview.mp4")
-    result["video_url"] = f"/media/{job_id}/preview.mp4" if (job_dir / "preview.mp4").exists() else None
     result["timings"] = {"queue_sec": round(t0 - job["created_at"], 2),
                          "processing_sec": round(time.time() - t0, 2)}
     db.finish(job_id, result)
-    log.info("job %s done: %s, %d events, %.1fs",
-             job_id, result["verdict"], len(result["events"]), time.time() - t0)
+    log.info("job %s done: %s, %d violations, %.1fs",
+             job_id, result["verdict"], len(result["violations"]), time.time() - t0)
 
 
 def _loop(stop: threading.Event) -> None:
