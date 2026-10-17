@@ -89,6 +89,8 @@ def _done_view(job: dict, for_api: bool) -> dict:
                  for f in v.evidence_frames]}
             for v in result.violations]}
         view["feedback"] = db.get_feedback(job["id"])
+        view["filename"] = job["filename"]
+        view["created_at"] = job["created_at"]
         view["video_url"] = f"/media/{job['id']}/preview.mp4"
         view["original_url"] = f"/media/{job['id']}/video.mov"
     view["analyzer"] = stored["analyzer"]
@@ -134,6 +136,20 @@ async def analyze(file: UploadFile = File(...)):
 @app.get("/api/v1/jobs/{job_id}", dependencies=[Depends(require_key)])
 def get_job(job_id: str):
     return _job_view(_load(job_id), for_api=True)
+
+
+@app.get("/api/v1/jobs/{job_id}/analysis", dependencies=[Depends(require_key)],
+         include_in_schema=False)
+def get_analysis(job_id: str):
+    """Внутренний AnalysisResult для оценки качества (scripts/benchmark.py)."""
+    job = _load(job_id)
+    if job["status"] != "done":
+        raise HTTPException(status_code=409, detail="Задача ещё не завершена")
+    analysis = job["result"]["analysis"]
+    for v in analysis["violations"]:
+        for f in v["evidence_frames"]:
+            f["image_path"] = Path(f["image_path"]).name  # пути сервера наружу не отдаём
+    return analysis
 
 
 @app.get("/health")

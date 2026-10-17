@@ -221,7 +221,9 @@ video {
   font-size: 12px;
   color: var(--slate);
 }
-.quiet-link { display: inline-block; margin-top: 16px; font-size: 14px; color: var(--slate); }
+.viewer-actions { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-top: 16px; }
+.quiet-link { font-size: 14px; color: var(--slate); }
+.print-head, .print-sign { display: none; }
 
 /* Событие: таймкод — главный элемент страницы. */
 .event { padding: 4px 0 28px; }
@@ -329,4 +331,32 @@ video {
   .viewer { position: static; max-width: 300px; margin: 0 auto; width: 100%; }
   .frames img { height: 180px; }
   .mode { margin-left: 0; }
+}
+
+/* Отчёт для печати и PDF: только то, что нужно приложить к служебной записке. */
+@media print {
+  @page { size: A4; margin: 14mm; }
+  body { background: #fff; font-size: 11pt; }
+  .top, .intake, .checks, .foot, .viewer, .review button, .zoom { display: none !important; }
+  main { padding: 0; max-width: none; }
+  .print-head { display: block; margin-bottom: 10pt; padding-bottom: 8pt; border-bottom: 2pt solid var(--crimson); }
+  .print-title { margin: 0 0 6pt; font-size: 16pt; font-weight: 700; color: var(--wine); }
+  .print-head dl { display: grid; grid-template-columns: max-content 1fr; gap: 2pt 12pt; margin: 0; }
+  .print-head dt { color: var(--slate); }
+  .print-head dd { margin: 0; }
+  .verdict { animation: none !important; clip-path: none !important; padding: 10pt 12pt; border-radius: 6pt;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .layout { display: block; margin-top: 10pt; }
+  .event { break-inside: avoid; padding: 10pt 0; }
+  .event + .event { padding-top: 10pt; }
+  .timecode { font-size: 26pt; }
+  .frames { overflow: visible; }
+  .frames img { height: 170pt; }
+  .basis-link::after { content: " (" attr(href) ")"; color: var(--slate); font-size: 9pt; }
+  .review-state { color: var(--ink); font-weight: 600; }
+  .review-state:empty::before { content: "Оценка проверяющего: не указана"; font-weight: 400; color: var(--slate); }
+  .print-sign { display: block; margin-top: 18pt; break-inside: avoid; }
+  .print-sign p { margin: 0 0 10pt; }
+  .print-note { font-size: 9pt; color: var(--slate); }
+  .clean { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
 }

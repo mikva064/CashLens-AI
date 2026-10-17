@@ -42,6 +42,14 @@
     </section>
 
     <section id="result" class="result" hidden aria-label="Результат проверки">
+      <div class="print-head">
+        <p class="print-title">Отчёт о проверке видеозаписи кассы</p>
+        <dl>
+          <dt>Файл</dt><dd id="r-file"></dd>
+          <dt>Проверено</dt><dd id="r-date"></dd>
+          <dt>Номер проверки</dt><dd id="r-id"></dd>
+        </dl>
+      </div>
       <div id="demo" class="demo" hidden>
         Демо-режим: модель не подключена. Результат сгенерирован заглушкой и не отражает содержимое видео.
       </div>
@@ -56,11 +64,20 @@
           <video id="player" controls muted playsinline preload="metadata"></video>
           <div class="track" id="track" aria-label="Шкала записи с отметками событий"></div>
           <div class="track-scale"><span>00:00</span><span id="track-end"></span></div>
-          <a id="download" class="quiet-link" download="cashlens-result.json">Скачать результат в JSON</a>
+          <div class="viewer-actions">
+            <button type="button" id="print" class="ghost">Распечатать отчёт</button>
+            <a id="download" class="quiet-link" download="cashlens-result.json">Скачать JSON</a>
+          </div>
         </aside>
 
         <div class="findings">
           <div id="events"></div>
+          <div class="print-sign">
+            <p>Решение проверяющего: ______________________________</p>
+            <p>Проверяющий: ____________________ (ФИО, подпись)    Дата: ____________</p>
+            <p class="print-note">Отчёт сформирован CashLens автоматически и является подсказкой для
+              проверяющего, а не заключением. Лица на записи не распознавались.</p>
+          </div>
           <div id="clean" class="clean" hidden>
             <p>В записи не найдено действий, которые подпадают под проверяемые правила.</p>
             <p class="muted">Ниже — что именно сервис искал в этой записи.</p>

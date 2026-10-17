@@ -281,6 +281,11 @@ function render(job) {
   $("clean").hidden = found;
   if (!found) $("checks").open = true;
 
+  $("r-file").textContent = job.filename || "";
+  $("r-date").textContent = new Date(job.created_at * 1000).toLocaleString("ru-RU");
+  $("r-id").textContent = job.job_id;
+  $("print").onclick = () => window.print();
+
   const blob = new Blob([JSON.stringify(job, null, 2)], { type: "application/json" });
   $("download").href = URL.createObjectURL(blob);
   $("result").hidden = false;
