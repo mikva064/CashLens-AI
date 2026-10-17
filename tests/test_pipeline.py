@@ -188,9 +188,9 @@ class PipelineTests(unittest.TestCase):
                     source_context.extend((timestamps[0], timestamps[-1]))
                     return response(event(1.6))
                 return response()
-            # The original beginning/end disprove the apparent middle action.
-            # A narrow +/- radius or naive downsampling loses this evidence.
-            if all(timestamp in timestamps for timestamp in source_context):
+            # Preserve the apparent action as well as the original beginning/end
+            # that disprove it. Sparse naive downsampling can lose either.
+            if all(timestamp in timestamps for timestamp in [*source_context, 1.6]):
                 return response()
             return response(event(1.6))
 
@@ -205,8 +205,12 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(fine_calls), 1)
         self.assertEqual(source_context, [1.0, 2.0])
         fine_times = [round(ts, 6) for ts in fine_calls[0]["timestamps"]]
-        self.assertEqual(fine_times, [0.8, 1.0, 2.0, 2.2])
+        self.assertEqual(fine_times, [1.0, 1.4, 1.6, 2.0])
         self.assertEqual(len(fine_times), config.max_refine_frames)
+
+    def test_refine_cap_must_allow_both_context_edges_and_candidate(self):
+        with self.assertRaisesRegex(ValueError, "max_refine_frames >= 3"):
+            replace(self.config, max_refine_frames=2)
 
     def test_same_rule_candidates_from_one_context_share_one_fine_call(self):
         coarse_calls = 0

@@ -1,7 +1,7 @@
 """Offline Qwen inference over a short sequence of timestamped video frames.
 
-This module deliberately returns model text. Schema validation, event merging,
-legal-source lookup and final verdicts belong to the calling pipeline.
+The model emits a compact internal JSON format. Validated indices are expanded
+to the pipeline's event JSON; legal-source lookup and verdicts stay in the pipeline.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 
-from .errors import ModelUnavailableError, RuleValidationError
+from .errors import InvalidModelOutputError, ModelUnavailableError, RuleValidationError
 
 if TYPE_CHECKING:
     from .video import SampledFrame
@@ -29,30 +29,77 @@ log = logging.getLogger("cashlens.model")
 
 def _build_output_schema(rules: list[dict[str, str]], timestamps: list[float],
                          phase: str = "coarse") -> dict:
-    """Constrain IDs and times to the actual reviewed window, never legal text."""
+    """Use bounded indices so the model never spends tokens copying IDs/times."""
     if phase not in {"coarse", "fine"}:
         raise ValueError("phase must be 'coarse' or 'fine'.")
-    description = ({"type": "string", "enum": [COARSE_DESCRIPTION]}
-                   if phase == "coarse" else
-                   {"type": "string", "minLength": 1, "maxLength": DESCRIPTION_MAX_CHARS})
+    if not rules or not timestamps:
+        raise ValueError("At least one reviewed rule and supplied frame are required")
+    if phase == "fine" and len(rules) != 1:
+        raise ValueError("Fine verification requires exactly one reviewed rule")
+    properties = {"f": {"type": "integer", "enum": list(range(len(timestamps)))}}
+    if phase == "coarse":
+        properties = {"r": {"type": "integer", "enum": list(range(len(rules)))}, **properties}
+    else:
+        properties["d"] = {"type": "string", "minLength": 1, "maxLength": DESCRIPTION_MAX_CHARS}
     return {
-        "type": "object", "additionalProperties": False, "required": ["events"],
+        "type": "object", "additionalProperties": False, "required": ["e"],
         "properties": {
-            "events": {
+            "e": {
                 "type": "array", "minItems": 0,
                 "maxItems": MAX_WINDOW_EVENTS if phase == "coarse" else 1,
                 "items": {
                     "type": "object", "additionalProperties": False,
-                    "required": ["rule_id", "timecode_sec", "description"],
-                    "properties": {
-                        "rule_id": {"type": "string", "enum": [rule["id"] for rule in rules]},
-                        "timecode_sec": {"type": "number", "enum": sorted(set(timestamps))},
-                        "description": description,
-                    },
+                    "required": list(properties), "properties": properties,
                 },
             },
         },
     }
+
+
+def _expand_wire_response(text: str, rules: list[dict[str, str]], timestamps: list[float],
+                          phase: str = "coarse") -> str:
+    """Fail closed and map compact indices to exact trusted IDs and global times."""
+    _build_output_schema(rules, timestamps, phase)
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("Duplicate compact response key")
+            result[key] = value
+        return result
+
+    def invalid_constant(value):
+        raise ValueError("Non-finite JSON constant")
+
+    try:
+        parsed = json.loads(text, object_pairs_hook=unique_object, parse_constant=invalid_constant)
+        if type(parsed) is not dict or set(parsed) != {"e"} or type(parsed["e"]) is not list:
+            raise ValueError("Invalid compact response object")
+        limit = MAX_WINDOW_EVENTS if phase == "coarse" else 1
+        if len(parsed["e"]) > limit:
+            raise ValueError("Too many compact events")
+        events = []
+        for event in parsed["e"]:
+            expected = {"r", "f"} if phase == "coarse" else {"f", "d"}
+            if type(event) is not dict or set(event) != expected:
+                raise ValueError("Invalid compact event fields")
+            frame_index = event["f"]
+            rule_index = event["r"] if phase == "coarse" else 0
+            if type(frame_index) is not int or not 0 <= frame_index < len(timestamps):
+                raise ValueError("Frame index is outside the supplied window")
+            if type(rule_index) is not int or not 0 <= rule_index < len(rules):
+                raise ValueError("Rule index is outside the reviewed registry")
+            description = COARSE_DESCRIPTION if phase == "coarse" else event["d"]
+            if (type(description) is not str or not description.strip()
+                    or len(description) > DESCRIPTION_MAX_CHARS):
+                raise ValueError("Invalid compact event description")
+            events.append({"rule_id": rules[rule_index]["id"],
+                           "timecode_sec": timestamps[frame_index],
+                           "description": description.strip()})
+        return json.dumps({"events": events}, ensure_ascii=False, separators=(",", ":"))
+    except (ValueError, TypeError, KeyError, IndexError, RecursionError) as exc:
+        raise InvalidModelOutputError("The model returned invalid compact event JSON") from exc
 
 
 def _has_complete_json_object(text: str) -> bool:
@@ -124,13 +171,17 @@ def _validated_rule_data(rules: list[dict]) -> list[dict[str, str]]:
 
 
 def _build_prompt(rules: list[dict[str, str]], phase: str) -> str:
-    rule_json = json.dumps(rules, ensure_ascii=False)
+    numbered_rules = [{"r": index, "title": rule["title"],
+                       "observable_condition": rule["observable_condition"]}
+                      for index, rule in enumerate(rules)]
+    rule_json = json.dumps(numbered_rules, ensure_ascii=False)
     phase_instructions = (
         f"This is candidate localization: return at most {MAX_WINDOW_EVENTS} events. "
-        f'For every candidate, description must be exactly "{COARSE_DESCRIPTION}". '
+        'Return {"e":[{"r":0,"f":0}]}: r is the supplied rule index, f is the supplied frame index. '
         "Do not narrate or explain candidates in this phase. "
         if phase == "coarse" else
         "This is detailed verification: confirm at most ONE event, or return an empty list. "
+        'Return {"e":[{"f":0,"d":"visible evidence"}]} for the sole supplied rule. '
         f"Description must be one short Russian sentence, at most 12 words and {DESCRIPTION_MAX_CHARS} characters. "
         "Describe only directly visible evidence. "
     )
@@ -141,7 +192,8 @@ def _build_prompt(rules: list[dict[str, str]], phase: str) -> str:
         "First establish the visible scene: relevant people, a cash-handling workplace, "
         "and an actual cash transaction must be directly visible where required by the rule. "
         "Unrelated content, an empty scene, or unclear activity cannot establish an event. "
-        "Frame labels give seconds in the ORIGINAL video; preserve that coordinate system. "
+        "Each image has an f index and its original video time. Return only the supplied "
+        "integer f index; software restores the exact original timestamp. "
         "Consider the sequence, including what happens before and after an action. "
         "Do not invent actions between sampled frames. Require direct visual support "
         "for the complete observable condition. If objects or actions are occluded, "
@@ -152,22 +204,20 @@ def _build_prompt(rules: list[dict[str, str]], phase: str) -> str:
         "Use neutral labels such as employee or person. Do not invent laws, legal "
         "citations, source URLs, rule IDs, or additional rule categories. "
         "Report visible evidence in a concise Russian description, without a legal "
-        "conclusion. Choose timecode_sec from a supplied frame timestamp. "
+        "conclusion. Choose f from a supplied frame label. "
         "Report each distinct action only once, at its earliest decisive frame. "
         "A persistent condition is one event in this window, not one event per frame. "
         f"{phase_instructions}"
         "Use plain Russian characters, without Unicode escape sequences. "
-        "Return ONLY a JSON object with this exact shape: "
-        '{"events":[{"rule_id":"allowed ID","timecode_sec":12.3,'
-        '"description":"phase-specific description"}]}. '
-        'When no condition is directly supported, return {"events":[]}. '
+        "Do not output rule IDs, timestamp decimals, or expanded field names. "
+        'When no condition is directly supported, return {"e":[]}. '
         "Do not wrap JSON in Markdown. "
         f"Analysis phase: {phase}. "
         f"REVIEWED_RULES_JSON: {rule_json}\n"
         "FINAL CHECK: Report an event only if the frames directly show the people, "
         "cash-handling workplace, and transaction sequence needed to satisfy EVERY "
         "part of that rule. If the scene is unrelated, empty, unclear, or any required "
-        'evidence is missing, return {"events":[]}. Never fill missing facts by guessing.'
+        'evidence is missing, return {"e":[]}. Never fill missing facts by guessing.'
     )
 
 
@@ -273,7 +323,7 @@ class LocalQwenBackend:
         phase: str = "coarse",
         timeout_sec: float | None = None,
     ) -> str:
-        """Return raw JSON text from one short, chronologically ordered window."""
+        """Return pipeline event JSON expanded from a validated compact response."""
         reviewed_rules = _validated_rule_data(rules)
         if phase not in {"coarse", "fine"}:
             raise ValueError("phase must be 'coarse' or 'fine'.")
@@ -286,12 +336,13 @@ class LocalQwenBackend:
             raise ValueError("Frame timestamps must be finite and nonnegative.")
         if any(right < left for left, right in zip(timestamps, timestamps[1:])):
             raise ValueError("Frames must be ordered by timestamp.")
+        output_schema = _build_output_schema(reviewed_rules, timestamps, phase)
         content: list[dict[str, str]] = [
             {"type": "text", "text": _build_prompt(reviewed_rules, phase)}
         ]
-        for timestamp in timestamps:
+        for index, timestamp in enumerate(timestamps):
             content.extend([
-                {"type": "text", "text": f"Frame at {timestamp:.6f} seconds in original video:"},
+                {"type": "text", "text": f"Frame f={index}, at {timestamp:.6f} seconds in original video:"},
                 {"type": "image"},
             ])
         with self._lock:
@@ -323,7 +374,7 @@ class LocalQwenBackend:
                 # and Kazakh Cyrillic directly instead of expensive \u escapes.
                 parser_config.alphabet += "".join(chr(code) for code in range(0x0400, 0x0500))
                 schema_parser = JsonSchemaParser(
-                    _build_output_schema(reviewed_rules, timestamps, phase), config=parser_config,
+                    output_schema, config=parser_config,
                 )
                 prefix_function = build_transformers_prefix_allowed_tokens_fn(
                     self._tokenizer_data, schema_parser,
@@ -369,8 +420,8 @@ class LocalQwenBackend:
                 )
                 if len(answers) != 1 or not isinstance(answers[0], str) or not answers[0].strip():
                     raise ModelUnavailableError("The local model returned no usable text.")
-                return answers[0]
-            except ModelUnavailableError:
+                return _expand_wire_response(answers[0], reviewed_rules, timestamps, phase)
+            except (ModelUnavailableError, InvalidModelOutputError):
                 raise
             except Exception as exc:
                 raise ModelUnavailableError(

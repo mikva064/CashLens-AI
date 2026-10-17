@@ -48,8 +48,8 @@ class QwenAnalyzer:
         self._rules = load_rules(self.rules_path)
         config = AnalyzerConfig(
             sample_fps=float(os.getenv("CASHLENS_SAMPLE_FPS", "1")),
-            window_sec=float(os.getenv("CASHLENS_WINDOW_SEC", "8")),
-            overlap_sec=float(os.getenv("CASHLENS_OVERLAP_SEC", "2")),
+            window_sec=float(os.getenv("CASHLENS_WINDOW_SEC", "24")),
+            overlap_sec=float(os.getenv("CASHLENS_OVERLAP_SEC", "4")),
             max_edge=int(os.getenv("CASHLENS_MAX_EDGE", "448")),
             refine_max_edge=int(os.getenv("CASHLENS_REFINE_MAX_EDGE", "896")),
         )

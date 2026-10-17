@@ -15,8 +15,8 @@ from unittest.mock import MagicMock, patch
 
 from cashlens_ai.backend import (COARSE_DESCRIPTION, DESCRIPTION_MAX_CHARS, MAX_WINDOW_EVENTS,
                                  LocalQwenBackend, _StopAfterJsonObject, _build_output_schema,
-                                 _build_prompt, _has_complete_json_object)
-from cashlens_ai.errors import ModelUnavailableError, RuleValidationError
+                                 _build_prompt, _expand_wire_response, _has_complete_json_object)
+from cashlens_ai.errors import InvalidModelOutputError, ModelUnavailableError, RuleValidationError
 
 
 RULES = [{
@@ -62,7 +62,7 @@ class BackendTests(unittest.TestCase):
         processor = MagicMock()
         batch = FakeBatch(input_ids=SimpleNamespace(shape=(1, 99)), attention_mask=object())
         processor.return_value = batch
-        processor.batch_decode.return_value = ['{"events":[]}']
+        processor.batch_decode.return_value = ['{"e":[]}']
         transformers.AutoProcessor = SimpleNamespace(from_pretrained=MagicMock(return_value=processor))
         transformers.BitsAndBytesConfig = MagicMock(return_value="quant-config")
         transformers.StoppingCriteriaList = list
@@ -107,15 +107,16 @@ class BackendTests(unittest.TestCase):
                     self.backend.describe(frames, RULES)
                 load.assert_not_called()
 
-    def test_offline_generation_preserves_absolute_times_and_raw_response(self):
+    def test_offline_generation_expands_compact_indices_to_absolute_times(self):
         torch, transformers, model, processor, batch = self.fake_dependencies()
-        raw = '  {"events":[]}  '
+        raw = '  {"e":[{"r":0,"f":1}]}  '
         processor.batch_decode.return_value = [raw]
         with patch.dict(sys.modules, self.dependency_modules(torch, transformers)), patch.dict(os.environ):
             result = self.backend.describe(self.frames, RULES, timeout_sec=7.5)
             self.assertEqual(os.environ["HF_HUB_OFFLINE"], "1")
             self.assertEqual(os.environ["TRANSFORMERS_OFFLINE"], "1")
-        self.assertEqual(result, raw)
+        self.assertEqual(json.loads(result), {"events": [{"rule_id": "demo_rule",
+                         "timecode_sec": 11.5, "description": COARSE_DESCRIPTION}]})
         self.assertEqual(batch.device, "cuda:0")
         options = transformers.Qwen3VLForConditionalGeneration.from_pretrained.call_args.kwargs
         self.assertTrue(options["local_files_only"])
@@ -138,11 +139,11 @@ class BackendTests(unittest.TestCase):
         )
         schema_call = transformers._lmfe.JsonSchemaParser.call_args
         schema = schema_call.args[0]
-        self.assertEqual(schema["properties"]["events"]["maxItems"], 3)
-        event_properties = schema["properties"]["events"]["items"]["properties"]
-        self.assertEqual(event_properties["rule_id"]["enum"], ["demo_rule"])
-        self.assertEqual(event_properties["timecode_sec"]["enum"], [10.25, 11.5])
-        self.assertEqual(event_properties["description"]["enum"], [COARSE_DESCRIPTION])
+        self.assertEqual(schema["properties"]["e"]["maxItems"], 3)
+        event_properties = schema["properties"]["e"]["items"]["properties"]
+        self.assertEqual(event_properties["r"]["enum"], [0])
+        self.assertEqual(event_properties["f"]["enum"], [0, 1])
+        self.assertEqual(set(event_properties), {"r", "f"})
         self.assertIn("Я", schema_call.kwargs["config"].alphabet)
         self.assertTrue(schema_call.kwargs["config"].force_json_field_order)
         self.assertIs(transformers._lmfe.JsonSchemaParser.return_value.config,
@@ -151,12 +152,14 @@ class BackendTests(unittest.TestCase):
         all_text = " ".join(item.get("text", "") for item in chat[0]["content"])
         self.assertIn("10.250000 seconds", all_text)
         self.assertIn("11.500000 seconds", all_text)
-        self.assertIn('"id": "demo_rule"', all_text)
+        self.assertIn('"r": 0', all_text)
+        self.assertIn("Frame f=1", all_text)
+        self.assertNotIn('"id": "demo_rule"', all_text)
         self.assertIn("Never identify people", all_text)
         self.assertIn("Do not invent laws", all_text)
         self.assertIn("First establish the visible scene", all_text)
         self.assertIn("transaction sequence needed to satisfy EVERY", all_text)
-        self.assertIn('evidence is missing, return {"events":[]}', all_text)
+        self.assertIn('evidence is missing, return {"e":[]}', all_text)
         self.assertEqual(processor.call_args.kwargs["images"], [frame.image for frame in self.frames])
 
     def test_cuda_absence_raises_error_without_cpu_or_empty_result(self):
@@ -221,10 +224,10 @@ class BackendTests(unittest.TestCase):
         transformers._lmfe_integration.build_token_enforcer_tokenizer_data.assert_called_once()
         self.assertEqual(transformers._lmfe.JsonSchemaParser.call_count, 2)
         schema = transformers._lmfe.JsonSchemaParser.call_args.args[0]
-        times = schema["properties"]["events"]["items"]["properties"]["timecode_sec"]
-        self.assertEqual(times["enum"], [20.5])
-        self.assertEqual(schema["properties"]["events"]["maxItems"], 1)
-        description = schema["properties"]["events"]["items"]["properties"]["description"]
+        times = schema["properties"]["e"]["items"]["properties"]["f"]
+        self.assertEqual(times["enum"], [0])
+        self.assertEqual(schema["properties"]["e"]["maxItems"], 1)
+        description = schema["properties"]["e"]["items"]["properties"]["d"]
         self.assertEqual(description["maxLength"], 96)
         self.assertNotIn("enum", description)
 
@@ -234,7 +237,8 @@ class BackendTests(unittest.TestCase):
         model.generate.return_value.__getitem__.return_value.shape = (1, 384)
         with patch.dict(sys.modules, self.dependency_modules(torch, transformers)), patch.dict(os.environ):
             with self.assertLogs("cashlens.model", level="INFO") as logs:
-                self.backend.describe(self.frames, RULES)
+                with self.assertRaises(InvalidModelOutputError):
+                    self.backend.describe(self.frames, RULES)
         diagnostic = " ".join(logs.output)
         self.assertIn("phase=coarse nframes=2 generated_tokens=384", diagnostic)
         self.assertIn("complete_json=False", diagnostic)
@@ -246,11 +250,65 @@ class BackendTests(unittest.TestCase):
     def test_prompts_use_bounded_phase_specific_descriptions(self):
         coarse = _build_prompt(RULES, "coarse")
         fine = _build_prompt(RULES, "fine")
-        self.assertIn(COARSE_DESCRIPTION, coarse)
+        self.assertIn('{"e":[{"r":0,"f":0}]}', coarse)
+        self.assertNotIn(COARSE_DESCRIPTION, coarse)
         self.assertIn("Do not narrate or explain candidates", coarse)
         self.assertIn("at most ONE event", fine)
         self.assertIn("at most 12 words and 96 characters", fine)
         self.assertNotIn(COARSE_DESCRIPTION, fine)
+        self.assertIn('{"e":[{"f":0,"d":"visible evidence"}]}', fine)
+
+
+class CompactWireTests(unittest.TestCase):
+    def test_coarse_indices_restore_trusted_id_and_exact_global_timestamp(self):
+        rules = RULES + [{**RULES[0], "id": "another_reviewed_rule"}]
+        timestamps = [123.1234567890123, 124.987654321]
+        result = json.loads(_expand_wire_response('{"e":[{"r":1,"f":0}]}', rules, timestamps))
+        self.assertEqual(result, {"events": [{"rule_id": "another_reviewed_rule",
+                         "timecode_sec": timestamps[0], "description": COARSE_DESCRIPTION}]})
+        self.assertEqual(_expand_wire_response('{"e":[]}', rules, timestamps), '{"events":[]}')
+
+    def test_fine_uses_sole_rule_and_expands_existing_pipeline_schema(self):
+        from cashlens_ai.pipeline import parse_model_response
+
+        timestamps = [120.123456789, 121.987654321]
+        text = _expand_wire_response('{"e":[{"f":1,"d":"Тестовое действие."}]}',
+                                     RULES, timestamps, "fine")
+        result = parse_model_response(text, allowed_ids={"demo_rule"},
+                                      first_sec=timestamps[0], last_sec=timestamps[-1])
+        self.assertEqual(result[0].rule_id, "demo_rule")
+        self.assertEqual(result[0].timecode_sec, timestamps[1])
+        self.assertEqual(result[0].description, "Тестовое действие.")
+
+    def test_invalid_or_ambiguous_indices_never_become_clean_events(self):
+        for event in ({"r": True, "f": 0}, {"r": 0, "f": False}, {"r": 0.0, "f": 0},
+                      {"r": 0, "f": 1.0}, {"r": "0", "f": 0}, {"r": -1, "f": 0},
+                      {"r": 1, "f": 0}, {"r": 0, "f": -1}, {"r": 0, "f": 2},
+                      {"r": 0}, {"r": 0, "f": 0, "law": "invented"}):
+            with self.subTest(event=event), self.assertRaises(InvalidModelOutputError):
+                _expand_wire_response(json.dumps({"e": [event]}), RULES, [12.0, 13.0])
+
+    def test_invalid_json_duplicate_keys_and_nonfinite_constants_are_rejected(self):
+        for text in ('{"e":', '{"e":[],"e":[]}', '{"e":[{"r":0,"r":0,"f":0}]}',
+                     '{"e":[{"r":0,"f":NaN}]}', '{"e":[]} trailing',
+                     '{"events":[]}', '{"e":null}', '{"e":{}}', '[]'):
+            with self.subTest(text=text), self.assertRaises(InvalidModelOutputError):
+                _expand_wire_response(text, RULES, [12.0])
+
+    def test_fine_description_and_cardinality_are_validated(self):
+        for event in ({"f": 0, "d": ""}, {"f": 0, "d": " "}, {"f": 0, "d": False},
+                      {"f": 0, "d": "x" * (DESCRIPTION_MAX_CHARS + 1)},
+                      {"f": True, "d": "x"}, {"r": 0, "f": 0, "d": "x"}):
+            with self.subTest(event=event), self.assertRaises(InvalidModelOutputError):
+                _expand_wire_response(json.dumps({"e": [event]}), RULES, [12.0], "fine")
+        for phase, event, count in (("coarse", {"r": 0, "f": 0}, 4),
+                                    ("fine", {"f": 0, "d": "x"}, 2)):
+            with self.subTest(phase=phase), self.assertRaises(InvalidModelOutputError):
+                _expand_wire_response(json.dumps({"e": [event] * count}), RULES, [12.0], phase)
+
+    def test_fine_requires_one_trusted_rule(self):
+        with self.assertRaises(ValueError):
+            _build_output_schema(RULES + [{**RULES[0], "id": "second_rule"}], [12.0], "fine")
 
 
 class JsonStoppingTests(unittest.TestCase):
@@ -306,7 +364,10 @@ class ConstrainedSchemaTests(unittest.TestCase):
 
     def setUp(self):
         try:
-            from lmformatenforcer import CharacterLevelParserConfig, JsonSchemaParser
+            # Character grammar needs no Torch. Avoid loading CUDA DLLs beside
+            # an active model service merely to exercise JSON transitions.
+            with patch.dict(sys.modules, {"torch": None}):
+                from lmformatenforcer import CharacterLevelParserConfig, JsonSchemaParser
         except ImportError:
             self.skipTest("Install the model extra to test the actual JSON grammar")
         self.parser_type = JsonSchemaParser
@@ -326,44 +387,41 @@ class ConstrainedSchemaTests(unittest.TestCase):
 
     @staticmethod
     def event(**changes):
-        result = {"rule_id": "demo_rule", "timecode_sec": 10.25,
-                  "description": COARSE_DESCRIPTION}
+        result = {"r": 0, "f": 0}
         result.update(changes)
         return result
 
     def test_valid_empty_and_multiple_events_allow_completion(self):
-        for value in ({"events": []}, {"events": [self.event()]},
-                      {"events": [self.event()] * MAX_WINDOW_EVENTS}):
+        for value in ({"e": []}, {"e": [self.event()]},
+                      {"e": [self.event()] * MAX_WINDOW_EVENTS}):
             with self.subTest(value=value):
                 self.assertTrue(self.accepts(json.dumps(value, ensure_ascii=False)))
 
-    def test_unknown_ids_unsupplied_times_and_long_description_are_blocked(self):
-        for event in (self.event(rule_id="invented_rule"), self.event(timecode_sec=12.0),
-                      self.event(description="x" * (DESCRIPTION_MAX_CHARS + 1))):
+    def test_unknown_rule_and_frame_indices_are_blocked(self):
+        for event in (self.event(r=1), self.event(f=2), self.event(r=-1), self.event(f=True)):
             with self.subTest(event=event):
-                self.assertFalse(self.accepts(json.dumps({"events": [event]}, ensure_ascii=False)))
+                self.assertFalse(self.accepts(json.dumps({"e": [event]}, ensure_ascii=False)))
 
     def test_fine_accepts_one_short_description_and_blocks_long_or_multiple_events(self):
-        event = self.event(description="Тестовое видимое действие.")
-        self.assertTrue(self.accepts(json.dumps({"events": [event]}, ensure_ascii=False), "fine"))
-        self.assertFalse(self.accepts(json.dumps({"events": [event, event]}, ensure_ascii=False), "fine"))
-        event = self.event(description="x" * (DESCRIPTION_MAX_CHARS + 1))
-        self.assertFalse(self.accepts(json.dumps({"events": [event]}, ensure_ascii=False), "fine"))
+        event = {"f": 0, "d": "Тестовое видимое действие."}
+        self.assertTrue(self.accepts(json.dumps({"e": [event]}, ensure_ascii=False), "fine"))
+        self.assertFalse(self.accepts(json.dumps({"e": [event, event]}, ensure_ascii=False), "fine"))
+        event = {"f": 0, "d": "x" * (DESCRIPTION_MAX_CHARS + 1)}
+        self.assertFalse(self.accepts(json.dumps({"e": [event]}, ensure_ascii=False), "fine"))
 
-    def test_coarse_description_is_fixed_instead_of_generated_narrative(self):
+    def test_coarse_description_cannot_be_generated(self):
         event = self.event(description="Произвольное описание кандидата")
-        self.assertFalse(self.accepts(json.dumps({"events": [event]}, ensure_ascii=False)))
+        self.assertFalse(self.accepts(json.dumps({"e": [event]}, ensure_ascii=False)))
 
     def test_maximum_array_length_and_unknown_legal_field_are_blocked(self):
-        self.assertFalse(self.accepts(json.dumps({"events": [self.event()] * (MAX_WINDOW_EVENTS + 1)})))
+        self.assertFalse(self.accepts(json.dumps({"e": [self.event()] * (MAX_WINDOW_EVENTS + 1)})))
         event = self.event()
         event["law"] = "invented citation"
-        self.assertFalse(self.accepts(json.dumps({"events": [event]})))
+        self.assertFalse(self.accepts(json.dumps({"e": [event]})))
 
     def test_eos_is_unavailable_for_incomplete_or_malformed_object(self):
-        for text in ('{"events":', '{"events":[{"rule_id":"demo_rule"}]}',
-                     '{"events":[],}', '{"events":[],"verdict":"violation"}',
-                     '{"events":[{"rule_id":"demo_rule","timecode_sec":10.25,"description":"x'):
+        for text in ('{"e":', '{"e":[{"r":0}]}', '{"e":[],}',
+                     '{"e":[],"verdict":"violation"}', '{"e":[{"r":0,"f":'):
             with self.subTest(text=text):
                 self.assertFalse(self.accepts(text))
 
@@ -390,7 +448,7 @@ class LocalTokenizerGrammarTests(unittest.TestCase):
         from lmformatenforcer import CharacterLevelParserConfig, JsonSchemaParser
         from lmformatenforcer.integrations.transformers import build_transformers_prefix_allowed_tokens_fn
 
-        for text in ('{"events":[]}', '{"events": []}', '{ "events" : [ ] }'):
+        for text in ('{"e":[]}', '{"e": []}', '{ "e" : [ ] }'):
             with self.subTest(text=text):
                 config = CharacterLevelParserConfig(max_consecutive_whitespaces=1,
                                                     force_json_field_order=True)
@@ -403,6 +461,13 @@ class LocalTokenizerGrammarTests(unittest.TestCase):
                     self.assertIn(token, allowed, (text, self.tokenizer.decode([token])))
                     sequence.append(token)
                 self.assertIn(self.tokenizer.eos_token_id, prefix(0, torch.tensor(sequence)))
+
+    def test_compact_candidates_use_fewer_output_tokens_without_changing_frames(self):
+        wire = '{"e":[{"r":0,"f":0},{"r":0,"f":1},{"r":0,"f":0}]}'
+        expanded = _expand_wire_response(wire, RULES, [120.123456789, 121.987654321])
+        compact_count = len(self.tokenizer.encode(wire, add_special_tokens=False))
+        expanded_count = len(self.tokenizer.encode(expanded, add_special_tokens=False))
+        self.assertLess(compact_count, expanded_count / 2)
 
 
 if __name__ == "__main__":

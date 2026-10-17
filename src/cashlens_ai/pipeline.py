@@ -32,8 +32,8 @@ class WindowBackend(Protocol):
 @dataclass(frozen=True)
 class AnalyzerConfig:
     sample_fps: float = 1.0
-    window_sec: float = 8.0
-    overlap_sec: float = 2.0
+    window_sec: float = 24.0
+    overlap_sec: float = 4.0
     refine_radius_sec: float = 2.0
     refine_fps: float = 3.0
     max_refine_frames: int = 12
@@ -52,8 +52,8 @@ class AnalyzerConfig:
             raise ValueError("overlap_sec must be between zero and window_sec")
         if not math.isfinite(self.merge_sec) or self.merge_sec < 0:
             raise ValueError("merge_sec must be finite and nonnegative")
-        if self.max_edge < 32 or self.refine_max_edge < 32 or self.max_refine_frames < 2:
-            raise ValueError("Both max_edge values >= 32 and max_refine_frames >= 2 are required")
+        if self.max_edge < 32 or self.refine_max_edge < 32 or self.max_refine_frames < 3:
+            raise ValueError("Both max_edge values >= 32 and max_refine_frames >= 3 are required")
 
 
 def parse_model_response(text: str, *, allowed_ids: set[str],
@@ -193,11 +193,12 @@ class VideoAnalyzer:
             if not frames:
                 raise InvalidModelOutputError("Cannot verify the proposed event window")
             # A different sampling grid (and its half-open end) can omit an
-            # original endpoint. Reread those exact source frames at fine size.
-            context_edges = [get_frame_at(info.path, timestamp, max_edge=config.refine_max_edge)
-                             for timestamp in (first_sec, last_sec)]
-            required_times = {frame.timestamp_sec for frame in context_edges}
-            frames = sorted({frame.timestamp_sec: frame for frame in [*frames, *context_edges]}.values(),
+            # original endpoint or the candidate itself. Reserve all three
+            # source frames at fine size before capping the context.
+            context_anchors = [get_frame_at(info.path, timestamp, max_edge=config.refine_max_edge)
+                               for timestamp in (first_sec, event.timecode_sec, last_sec)]
+            required_times = {frame.timestamp_sec for frame in context_anchors}
+            frames = sorted({frame.timestamp_sec: frame for frame in [*frames, *context_anchors]}.values(),
                             key=lambda frame: frame.timestamp_sec)
             if len(frames) > config.max_refine_frames:
                 required = [frame for frame in frames if frame.timestamp_sec in required_times]
