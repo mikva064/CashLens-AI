@@ -116,6 +116,58 @@ def build_review(
     return output_path.resolve()
 
 
+_IMPORT_VALIDATOR_JS = r'''
+function validateReviewImport(candidate, videos) {
+  const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+  const point = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+  if (!object(candidate) || candidate.schema_version !== 1 || candidate.purpose !== 'manual_review' || typeof candidate.includes_holdout !== 'boolean') {
+    throw new Error('Неверный формат: нужен JSON, экспортированный из разметки CashLens (schema_version 1).');
+  }
+  if (!Array.isArray(candidate.videos) || !candidate.videos.length) throw new Error('В файле нет массива размеченных видео.');
+  const known = new Map(videos.map((video, index) => [video.sha256, {video, index}]));
+  const seen = new Set();
+  const updates = [];
+  candidate.videos.forEach(record => {
+    if (!object(record) || typeof record.sha256 !== 'string' || !known.has(record.sha256)) {
+      throw new Error('В файле есть неизвестный SHA256. Выберите JSON для этой выборки; отложенные видео сюда не импортируются.');
+    }
+    if (seen.has(record.sha256)) throw new Error('В файле повторяется одна группа SHA256.');
+    seen.add(record.sha256);
+    const {video, index} = known.get(record.sha256);
+    const title = video.filenames[0];
+    if (record.binary_label !== video.label) throw new Error(`${title}: исходная метка отличается от текущего manifest.json.`);
+    if (typeof record.reviewed !== 'boolean' || typeof record.notes !== 'string' || !Array.isArray(record.events)) {
+      throw new Error(`${title}: неверные поля reviewed, notes или events.`);
+    }
+    const eventIds = new Set();
+    const events = record.events.map((event, eventIndex) => {
+      const prefix = `${title}, событие ${eventIndex + 1}`;
+      if (!object(event) || typeof event.event_id !== 'string' || !event.event_id || eventIds.has(event.event_id)) {
+        throw new Error(`${prefix}: идентификатор события отсутствует или повторяется.`);
+      }
+      eventIds.add(event.event_id);
+      if (typeof event.type !== 'string' || typeof event.rule_id !== 'string' || typeof event.notes !== 'string') {
+        throw new Error(`${prefix}: type, rule_id и notes должны быть текстом.`);
+      }
+      if ((event.start_sec !== null && !point(event.start_sec)) || (event.end_sec !== null && !point(event.end_sec))) {
+        throw new Error(`${prefix}: границы должны быть null или конечными неотрицательными числами.`);
+      }
+      if (event.start_sec !== null && event.end_sec !== null && event.end_sec < event.start_sec) {
+        throw new Error(`${prefix}: конец находится раньше начала.`);
+      }
+      if (!Array.isArray(event.evidence_sec) || !event.evidence_sec.every(point)) {
+        throw new Error(`${prefix}: таймкоды доказательств должны быть конечными неотрицательными числами.`);
+      }
+      return {event_id: event.event_id, type: event.type, start_sec: event.start_sec, end_sec: event.end_sec,
+        rule_id: event.rule_id, evidence_sec: [...event.evidence_sec], evidence_input: event.evidence_sec.join(', '), notes: event.notes};
+    });
+    updates.push({index, reviewed: record.reviewed, notes: record.notes, events});
+  });
+  return updates;
+}
+'''
+
+
 _HTML = r'''<!doctype html>
 <html lang="ru">
 <head>
@@ -143,8 +195,8 @@ label{display:grid;gap:4px}input,select,textarea{width:100%;border:1px solid #46
 </style>
 </head>
 <body>
-<header><div><h1>CashLens · разметка видео</h1><p class="muted" id="mode"></p></div><div><button id="export" type="button">Экспорт JSON</button><p id="save-status" class="muted" aria-live="polite">Изменений нет</p></div></header>
-<div class="notice"><p><strong>Нормативные ссылки ещё не прошли правовую проверку.</strong> Поле rule_id заполняйте только после проверки источника.</p><p>Точки из Excel — ориентиры, а не границы событий. Разметьте интервалы вручную. Видео открываются с вашего диска. Перед закрытием экспортируйте JSON: изменения хранятся только в этой вкладке.</p></div>
+<header><div><h1>CashLens · разметка видео</h1><p class="muted" id="mode"></p></div><div><div class="row"><button id="import" type="button">Импорт JSON</button><input id="import-file" type="file" accept=".json,application/json" hidden><button id="export" type="button">Экспорт JSON</button></div><p id="save-status" class="muted" aria-live="polite">Изменений нет</p><p id="import-status" class="status" aria-live="polite"></p></div></header>
+<div class="notice"><p><strong>Нормативные ссылки ещё не прошли правовую проверку.</strong> Поле rule_id заполняйте только после проверки источника.</p><p>Точки из Excel — ориентиры, а не границы событий. Разметьте интервалы вручную. Видео открываются с вашего диска. Перед закрытием экспортируйте JSON: изменения хранятся только в этой вкладке. Чтобы продолжить позже, импортируйте сохранённый JSON.</p></div>
 <main><aside><h2>Уникальные видео</h2><p class="muted" id="progress"></p><div id="video-list"></div></aside>
 <section class="workspace"><div id="empty" hidden>Нет видео для выбранного режима. Проверьте manifest.json и разделение данных.</div><div id="review-content">
 <h2 id="video-title"></h2><div class="analysis-grid"><div>
@@ -171,6 +223,7 @@ let selected = -1;
 let dirty = false;
 let eventCounter = 0;
 let pendingSeek = null;
+__CASHLENS_IMPORT_VALIDATOR__
 function markDirty() { dirty = true; byId('save-status').textContent = 'Есть изменения · экспортируйте JSON'; }
 function formatTime(seconds) {
   if (!Number.isFinite(seconds)) return '—';
@@ -290,8 +343,38 @@ player.addEventListener('error', () => { byId('media-status').textContent = 'Н�
 byId('video-notes').addEventListener('input', event => { state[selected].notes = event.target.value; markDirty(); });
 byId('reviewed').addEventListener('change', event => { state[selected].reviewed = event.target.checked; markDirty(); updateProgress(); });
 byId('add-event').addEventListener('click', () => {
-  state[selected].events.push({event_id: `event-${++eventCounter}`, type: '', start_sec: null, end_sec: null, rule_id: '', evidence_sec: [], evidence_input: '', notes: ''});
+  let eventId;
+  do { eventId = `event-${++eventCounter}`; } while (state.some(video => video.events.some(event => event.event_id === eventId)));
+  state[selected].events.push({event_id: eventId, type: '', start_sec: null, end_sec: null, rule_id: '', evidence_sec: [], evidence_input: '', notes: ''});
   markDirty(); renderEvents();
+});
+byId('import').addEventListener('click', () => byId('import-file').click());
+byId('import-file').addEventListener('change', async event => {
+  const file = event.target.files && event.target.files[0];
+  if (!file) return;
+  byId('import').disabled = true; byId('import-file').disabled = true;
+  byId('import-status').classList.remove('error'); byId('import-status').textContent = 'Чтение локального JSON…';
+  try {
+    if (file.size > 10 * 1024 * 1024) throw new Error('Файл превышает 10 МБ. Выберите JSON разметки, а не видео.');
+    const candidate = JSON.parse(await file.text());
+    const updates = validateReviewImport(candidate, state);
+    if (dirty && !window.confirm('В этой вкладке есть несохранённые изменения. Заменить разметку видео из выбранного JSON? Разметка остальных видео сохранится.')) {
+      byId('import-status').textContent = 'Импорт отменён. Текущая разметка сохранена в этой вкладке.';
+      return;
+    }
+    // No state is replaced until every imported record has passed validation.
+    updates.forEach(({index, reviewed, notes, events}) => { state[index] = {...state[index], reviewed, notes, events}; });
+    dirty = updates.length !== state.length;
+    if (selected >= 0) selectVideo(selected);
+    updateProgress();
+    byId('import-status').textContent = `Импортировано видео: ${updates.length}. Файл прочитан локально.`;
+    byId('save-status').textContent = dirty ? 'Частичный импорт · экспортируйте объединённую разметку' : 'Разметка восстановлена из JSON';
+  } catch (error) {
+    byId('import-status').classList.add('error');
+    byId('import-status').textContent = `Импорт отклонён: ${error.message}. Текущая разметка не изменена.`;
+  } finally {
+    byId('import').disabled = false; byId('import-file').disabled = false; byId('import-file').value = '';
+  }
 });
 byId('export').addEventListener('click', () => {
   for (let i = 0; i < state.length; i++) {
@@ -308,8 +391,8 @@ byId('export').addEventListener('click', () => {
 });
 window.addEventListener('beforeunload', event => { if (dirty) { event.preventDefault(); event.returnValue = ''; } });
 updateProgress();
-if (state.length) selectVideo(0); else { byId('empty').hidden = false; byId('review-content').hidden = true; byId('export').disabled = true; }
+if (state.length) selectVideo(0); else { byId('empty').hidden = false; byId('review-content').hidden = true; byId('export').disabled = true; byId('import').disabled = true; }
 </script>
 </body>
 </html>
-'''
+'''.replace('__CASHLENS_IMPORT_VALIDATOR__', _IMPORT_VALIDATOR_JS)

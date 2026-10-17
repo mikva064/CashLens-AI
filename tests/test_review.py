@@ -1,12 +1,14 @@
 import json
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import tempfile
 import unittest
 from urllib.parse import unquote
 
 from cashlens_ai.errors import DatasetValidationError
-from cashlens_ai.review import build_review
+from cashlens_ai.review import _IMPORT_VALIDATOR_JS, build_review
 
 
 def payload_from(html):
@@ -111,6 +113,10 @@ class ReviewTests(unittest.TestCase):
         self.assertIn('data-field="rule_id"', html)
         self.assertIn('data-field="evidence_sec"', html)
         self.assertIn("URL.createObjectURL(new Blob", html)
+        self.assertIn('id="import-file" type="file" accept=".json,application/json"', html)
+        self.assertIn("JSON.parse(await file.text())", html)
+        self.assertIn("const updates = validateReviewImport(candidate, state)", html)
+        self.assertIn("dirty && !window.confirm(", html)
         self.assertIn("Нормативные ссылки ещё не прошли правовую проверку", html)
         self.assertNotIn("fetch(", html)
         self.assertNotIn("XMLHttpRequest", html)
@@ -131,6 +137,89 @@ class ReviewTests(unittest.TestCase):
         with self.assertRaisesRegex(DatasetValidationError, "Invalid weak timestamp"):
             self.build()
         self.assertFalse(self.output.exists())
+
+
+@unittest.skipUnless(shutil.which("node"), "Node.js is needed for browser-side import validation tests")
+class ImportValidationTests(unittest.TestCase):
+    """Exercise the actual standalone JS validator, without a browser or video IO."""
+
+    def setUp(self):
+        self.sha = "a" * 64
+        self.videos = [{"sha256": self.sha, "label": 1, "filenames": ["Х-4.mov"],
+                        "notes": "current unsaved notes", "events": []}]
+        self.candidate = {
+            "schema_version": 1, "purpose": "manual_review", "includes_holdout": False,
+            "videos": [{"sha256": self.sha, "binary_label": 1, "reviewed": True,
+                        "notes": "restored video notes", "events": [{
+                            "event_id": "event-7", "type": "manual type", "start_sec": 55.5,
+                            "end_sec": 68, "rule_id": "PENDING", "evidence_sec": [57, 65.2],
+                            "notes": "restored event notes"}]}],
+        }
+
+    def validate(self, *, mutation=""):
+        script = _IMPORT_VALIDATOR_JS + r'''
+const fs = require('node:fs');
+const {candidate, videos} = JSON.parse(fs.readFileSync(0, 'utf8'));
+const before = JSON.stringify(videos);
+''' + mutation + r'''
+try {
+  const updates = validateReviewImport(candidate, videos);
+  console.log(JSON.stringify({ok: true, updates, unchanged: JSON.stringify(videos) === before}));
+} catch (error) {
+  console.log(JSON.stringify({ok: false, error: error.message, unchanged: JSON.stringify(videos) === before}));
+}
+'''
+        result = subprocess.run([shutil.which("node"), "-e", script],
+                                input=json.dumps({"candidate": self.candidate, "videos": self.videos}),
+                                text=True, encoding="utf-8", capture_output=True, check=True)
+        return json.loads(result.stdout)
+
+    def test_exported_fields_restore_without_mutating_current_state(self):
+        result = self.validate()
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["unchanged"])
+        update = result["updates"][0]
+        self.assertEqual(update["index"], 0)
+        self.assertTrue(update["reviewed"])
+        self.assertEqual(update["notes"], "restored video notes")
+        event = update["events"][0]
+        for key, value in self.candidate["videos"][0]["events"][0].items():
+            self.assertEqual(event[key], value)
+        self.assertEqual(event["evidence_input"], "57, 65.2")
+
+    def test_draft_events_with_blank_boundaries_roundtrip(self):
+        event = self.candidate["videos"][0]["events"][0]
+        event.update(type="", start_sec=None, end_sec=None, rule_id="", evidence_sec=[], notes="")
+        result = self.validate()
+        self.assertTrue(result["ok"])
+        self.assertIsNone(result["updates"][0]["events"][0]["start_sec"])
+
+    def test_unknown_hash_after_valid_record_rejects_entire_import(self):
+        self.candidate["videos"].append({"sha256": "b" * 64})
+        result = self.validate()
+        self.assertFalse(result["ok"])
+        self.assertIn("неизвестный SHA256", result["error"])
+        self.assertTrue(result["unchanged"])
+        self.assertNotIn("updates", result)
+
+    def test_malformed_intervals_nonfinite_points_and_schema_are_rejected(self):
+        mutations = [
+            "candidate.schema_version = 2;",
+            "candidate.videos[0].reviewed = 'yes';",
+            "candidate.videos[0].binary_label = 0;",
+            "candidate.videos[0].events[0].end_sec = 1;",
+            "candidate.videos[0].events[0].start_sec = Infinity;",
+            "candidate.videos[0].events[0].evidence_sec = [NaN];",
+            "candidate.videos[0].events[0].evidence_sec = [-1];",
+            "candidate.videos[0].events[0].evidence_sec = ['57'];",
+            "candidate.videos[0].events.push(candidate.videos[0].events[0]);",
+            "candidate.videos.push(candidate.videos[0]);",
+        ]
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                result = self.validate(mutation=mutation)
+                self.assertFalse(result["ok"])
+                self.assertTrue(result["unchanged"])
 
 
 if __name__ == "__main__":
