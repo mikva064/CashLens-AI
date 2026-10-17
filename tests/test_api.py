@@ -9,6 +9,7 @@ _tmp = tempfile.mkdtemp()
 os.environ["CASHLENS_DATA_DIR"] = _tmp
 os.environ["CASHLENS_API_KEY"] = "test-key"
 os.environ["CASHLENS_MOCK_DELAY"] = "0"
+os.environ["CASHLENS_ANALYZER"] = "mock"
 
 import pytest
 from fastapi.testclient import TestClient
@@ -22,6 +23,10 @@ KEY = {"X-API-Key": "test-key"}
 @pytest.fixture(scope="module")
 def client():
     with TestClient(app) as c:
+        end = time.monotonic() + 5
+        while not c.get("/health").json()["analyzer_ready"]:
+            assert time.monotonic() < end, c.get("/health").json()
+            time.sleep(0.01)
         yield c
 
 

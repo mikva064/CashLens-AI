@@ -33,6 +33,7 @@ body {
 }
 header, main { max-width: 960px; margin: 0 auto; padding: 16px; }
 h1 { margin: 8px 0 0; }
+h2 { margin: 0; font-size: 17px; }
 h3 { margin: 0; font-size: 16px; }
 .muted { color: var(--muted); }
 .card {
@@ -53,6 +54,7 @@ form { display: flex; gap: 12px; flex-wrap: wrap; }
   color: var(--muted);
 }
 .drop.over { border-color: var(--accent); color: var(--accent); }
+.drop[aria-disabled="true"] { cursor: default; opacity: .65; }
 button {
   font: inherit;
   border: 0;
@@ -106,3 +108,11 @@ video { width: 100%; max-height: 480px; background: #000; border-radius: 6px; }
   border: 1px dashed var(--bad);
   color: var(--bad);
 }
+.model-status { margin: 10px 0 4px; font-weight: 600; }
+.model-status.ready { color: var(--ok); }
+.model-status.failed, .model-status.mock { color: var(--bad); }
+.model-card p { margin-top: 8px; margin-bottom: 8px; }
+details summary { color: var(--accent); cursor: pointer; }
+.coverage-rule { border-top: 1px solid var(--border); margin-top: 12px; padding-top: 12px; }
+.coverage-rule a { color: var(--accent); overflow-wrap: anywhere; }
+.coverage-rule p { margin: 4px 0; }

@@ -1,5 +1,6 @@
 """Integration checks with a generated MOV and a deterministic model stand-in."""
 
+from dataclasses import replace
 from fractions import Fraction
 import json
 from pathlib import Path
@@ -147,7 +148,8 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(violation.source, self.rule.source)
         fine_calls = [call for call in backend.calls if call["phase"] == "fine"]
         self.assertEqual(len(fine_calls), 1)
-        self.assertEqual([round(ts, 6) for ts in fine_calls[0]["timestamps"]], [0.2, 0.4, 0.6, 0.8])
+        self.assertEqual([round(ts, 6) for ts in fine_calls[0]["timestamps"]],
+                         [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2])
         self.assertEqual([rule["id"] for rule in fine_calls[0]["rules"]], [self.rule.id])
         self.assertEqual([round(frame.timestamp_sec, 6) for frame in violation.evidence_frames], [0.2, 0.8, 1.2])
         for frame in violation.evidence_frames:
@@ -172,6 +174,39 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result.verdict, "no_violation")
         self.assertEqual(result.violations, [])
         self.assertEqual(len([call for call in backend.calls if call["phase"] == "fine"]), 1)
+
+    def test_fine_retains_coarse_context_for_disconfirmation_under_frame_cap(self):
+        source_context = []
+        coarse_calls = 0
+
+        def detect(phase, frames, rules):
+            nonlocal coarse_calls
+            timestamps = [round(frame.timestamp_sec, 6) for frame in frames]
+            if phase == "coarse":
+                coarse_calls += 1
+                if coarse_calls == 2:
+                    source_context.extend((timestamps[0], timestamps[-1]))
+                    return response(event(1.6))
+                return response()
+            # The original beginning/end disprove the apparent middle action.
+            # A narrow +/- radius or naive downsampling loses this evidence.
+            if all(timestamp in timestamps for timestamp in source_context):
+                return response()
+            return response(event(1.6))
+
+        config = replace(self.config, refine_radius_sec=0.3,
+                         refine_fps=20, max_refine_frames=4)
+        backend = RecordingBackend(detect)
+        result = VideoAnalyzer(backend, [self.rule], config=config).analyze(
+            self.video, self.root / "job")
+        self.assertEqual(result.verdict, "no_violation")
+        self.assertEqual(result.violations, [])
+        fine_calls = [call for call in backend.calls if call["phase"] == "fine"]
+        self.assertEqual(len(fine_calls), 1)
+        self.assertEqual(source_context, [1.0, 2.0])
+        fine_times = [round(ts, 6) for ts in fine_calls[0]["timestamps"]]
+        self.assertEqual(fine_times, [0.8, 1.0, 2.0, 2.2])
+        self.assertEqual(len(fine_times), config.max_refine_frames)
 
     def test_unknown_rule_out_of_range_or_malformed_output_fails(self):
         bad_outputs = (

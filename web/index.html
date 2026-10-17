@@ -13,16 +13,27 @@
   </header>
 
   <main>
+    <section class="card model-card" aria-labelledby="model-heading">
+      <h2 id="model-heading">Локальный анализ</h2>
+      <p id="model-status" class="model-status loading" role="status">Проверяем готовность модели…</p>
+      <p id="model-name" class="muted"></p>
+      <p id="model-privacy" class="muted">Видео и кадры обрабатываются на этом компьютере. Облачные AI-сервисы не используются.</p>
+      <details id="coverage">
+        <summary id="coverage-summary">Подключённые правила и ограничения</summary>
+        <p id="limitations" class="muted">Сервис ищет видимые признаки по подключённым правилам. Результат требует проверки специалистом и не является окончательным юридическим заключением.</p>
+        <div id="rules"></div>
+      </details>
+    </section>
     <section class="card">
       <form id="upload">
         <label class="drop" id="drop">
-          <input type="file" id="file" accept=".mov,.mp4,video/*" hidden>
+          <input type="file" id="file" accept=".mov,.mp4,video/*" hidden disabled>
           <span id="drop-text">Перетащите .mov сюда или нажмите, чтобы выбрать</span>
         </label>
         <button type="submit" id="submit" disabled>Анализировать</button>
       </form>
       <progress id="progress" max="100" value="0" hidden></progress>
-      <p id="status" class="muted"></p>
+      <p id="status" class="muted" role="status" aria-live="polite"></p>
     </section>
 
     <section id="result" hidden>
@@ -30,6 +41,8 @@
         Демо-режим: модель не подключена, результат сгенерирован заглушкой и не отражает содержимое видео.
       </div>
       <div id="verdict" class="verdict"></div>
+      <p id="result-model" class="muted"></p>
+      <p class="muted">Проверьте последовательность действий и применимость указанного пункта. Отсутствие найденных событий не гарантирует соблюдения всех требований законодательства РК.</p>
       <div class="card">
         <video id="player" controls muted playsinline></video>
         <div id="timeline" class="timeline"></div>

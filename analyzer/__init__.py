@@ -26,7 +26,8 @@ class Analyzer(Protocol):
 
 
 def get_analyzer() -> Analyzer:
-    name = os.getenv("CASHLENS_ANALYZER", "mock")
+    # Production must never silently substitute a demonstration verdict.
+    name = os.getenv("CASHLENS_ANALYZER", "model").strip().lower()
     if name == "mock":
         from analyzer.mock import MockAnalyzer
         return MockAnalyzer()

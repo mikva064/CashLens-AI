@@ -61,10 +61,19 @@ def parse_model_response(text: str, *, allowed_ids: set[str],
     text = text.strip()
     if text.startswith("```"):
         lines = text.splitlines()
-        if len(lines) >= 3 and lines[-1].strip() == "```":
-            text = "\n".join(lines[1:-1])
+        if lines and lines[0].strip().lower() in {"```", "```json"}:
+            lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
     try:
-        result = ModelResponse.model_validate_json(text)
+        data, end = json.JSONDecoder().raw_decode(text)
+        # Some local generations add one unmatched presentation quote after a
+        # complete object. Accept that exact formatting defect, never prose,
+        # a second result or an incomplete object. Schema/rule checks still apply.
+        if not isinstance(data, dict) or text[end:].strip() not in {"", '"', "'"}:
+            raise ValueError("Unexpected text after event JSON")
+        result = ModelResponse.model_validate(data)
     except (ValueError, ValidationError) as exc:
         raise InvalidModelOutputError("Model response is not valid event JSON") from exc
     for event in result.events:
@@ -136,17 +145,29 @@ class VideoAnalyzer:
         fresh = 0
         windows_analyzed = 0
         candidates: list[ModelEvent] = []
+        candidate_context: dict[tuple[str, float], tuple[float, float]] = {}
+
+        def collect_candidates(frames):
+            for event in analyze_window(frames, list(self.rules.values()), "coarse"):
+                candidates.append(event)
+                # merge_events preserves the earliest anchor. Keep the context
+                # of its first originating window without changing ModelEvent.
+                candidate_context.setdefault(
+                    (event.rule_id, event.timecode_sec),
+                    (frames[0].timestamp_sec, frames[-1].timestamp_sec),
+                )
+
         for frame in iter_sampled_frames(info.path, fps=config.sample_fps, max_edge=config.max_edge):
             remaining()
             buffer.append(frame)
             fresh += 1
             if len(buffer) == frames_per_window:
-                candidates.extend(analyze_window(buffer, list(self.rules.values()), "coarse"))
+                collect_candidates(buffer)
                 windows_analyzed += 1
                 buffer = buffer[-overlap:] if overlap else []
                 fresh = 0
         if fresh:
-            candidates.extend(analyze_window(buffer, list(self.rules.values()), "coarse"))
+            collect_candidates(buffer)
             windows_analyzed += 1
         if not windows_analyzed:
             raise VideoReadError("No video windows were analyzed")
@@ -155,16 +176,34 @@ class VideoAnalyzer:
         confirmed: list[ModelEvent] = []
         for event in candidates:
             remaining()
-            start = max(0.0, event.timecode_sec - config.refine_radius_sec)
-            end = min(info.duration_sec, event.timecode_sec + config.refine_radius_sec)
+            first_sec, last_sec = candidate_context[(event.rule_id, event.timecode_sec)]
+            # Verification must retain the before/after context that produced
+            # the candidate, including service/transaction boundaries.
+            start = max(0.0, first_sec - config.refine_radius_sec)
+            end = min(info.duration_sec, last_sec + config.refine_radius_sec)
             frames = list(iter_sampled_frames(info.path, fps=config.refine_fps,
                           max_edge=config.refine_max_edge, start_sec=start, end_sec=end))
             if not frames:
                 raise InvalidModelOutputError("Cannot verify the proposed event window")
+            # A different sampling grid (and its half-open end) can omit an
+            # original endpoint. Reread those exact source frames at fine size.
+            context_edges = [get_frame_at(info.path, timestamp, max_edge=config.refine_max_edge)
+                             for timestamp in (first_sec, last_sec)]
+            required_times = {frame.timestamp_sec for frame in context_edges}
+            frames = sorted({frame.timestamp_sec: frame for frame in [*frames, *context_edges]}.values(),
+                            key=lambda frame: frame.timestamp_sec)
             if len(frames) > config.max_refine_frames:
-                last = len(frames) - 1
-                frames = [frames[round(i * last / (config.max_refine_frames - 1))]
-                          for i in range(config.max_refine_frames)]
+                required = [frame for frame in frames if frame.timestamp_sec in required_times]
+                optional = [frame for frame in frames if frame.timestamp_sec not in required_times]
+                slots = config.max_refine_frames - len(required)
+                if slots == 1:
+                    selected = [optional[len(optional) // 2]]
+                elif slots > 1:
+                    last = len(optional) - 1
+                    selected = [optional[round(i * last / (slots - 1))] for i in range(slots)]
+                else:
+                    selected = []
+                frames = sorted([*required, *selected], key=lambda frame: frame.timestamp_sec)
             confirmed.extend(analyze_window(frames, [self.rules[event.rule_id]], "fine"))
 
         violations = []

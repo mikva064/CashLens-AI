@@ -1,4 +1,5 @@
 import logging
+import math
 import secrets
 import time
 import uuid
@@ -22,8 +23,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname
 async def lifespan(_: FastAPI):
     db.init()
     stop = worker.start()
-    yield
-    stop.set()
+    try:
+        yield
+    finally:
+        worker.shutdown(stop)
 
 
 app = FastAPI(title="CashLens AI", version="0.1.0", lifespan=lifespan)
@@ -35,8 +38,16 @@ def require_key(x_api_key: str | None = Header(default=None)) -> None:
 
 
 async def _accept_upload(file: UploadFile) -> dict:
+    analyzer = worker.snapshot()
+    if not analyzer["ready"]:
+        await file.close()
+        message = ("Локальная модель загружается. Дождитесь готовности и повторите загрузку."
+                   if analyzer["status"] == "loading" else
+                   analyzer["error"] or "Локальная модель ещё не запущена")
+        raise HTTPException(status_code=503, detail=message, headers={"Retry-After": "5"})
     ext = Path(file.filename or "").suffix.lower()
     if ext not in ALLOWED_EXT:
+        await file.close()
         raise HTTPException(status_code=415, detail=f"Ожидается видео {sorted(ALLOWED_EXT)}")
 
     job_id = uuid.uuid4().hex
@@ -45,22 +56,23 @@ async def _accept_upload(file: UploadFile) -> dict:
     dst = job_dir / "video.mov"
     limit = MAX_UPLOAD_MB * 1024 * 1024
     size = 0
-    with open(dst, "wb") as out:
-        while chunk := await file.read(1 << 20):
-            size += len(chunk)
-            if size > limit:
-                out.close()
-                dst.unlink()
-                job_dir.rmdir()
-                raise HTTPException(status_code=413, detail=f"Файл больше {MAX_UPLOAD_MB} МБ")
-            out.write(chunk)
-
-    if media.probe_duration(dst) is None:
-        dst.unlink()
+    try:
+        with open(dst, "wb") as out:
+            while chunk := await file.read(1 << 20):
+                size += len(chunk)
+                if size > limit:
+                    raise HTTPException(status_code=413, detail=f"Файл больше {MAX_UPLOAD_MB} МБ")
+                out.write(chunk)
+        duration = media.probe_duration(dst)
+        if duration is None or not math.isfinite(duration) or duration <= 0:
+            raise HTTPException(status_code=422, detail="Файл не распознан как видео")
+        db.create(job_id, file.filename or "video.mov")
+    except Exception:
+        dst.unlink(missing_ok=True)
         job_dir.rmdir()
-        raise HTTPException(status_code=422, detail="Файл не распознан как видео")
-
-    db.create(job_id, file.filename or "video.mov")
+        raise
+    finally:
+        await file.close()
     return {"job_id": job_id, "status": "processing"}
 
 
@@ -101,7 +113,9 @@ def _job_view(job: dict, for_api: bool) -> dict:
     if status == "done":
         return _done_view(job, for_api)
     view = {"job_id": job["id"], "status": "processing" if status == "queued" else status,
-            "stage": status}
+            "stage": status,
+            "elapsed_sec": round(time.time() - job["created_at"], 1),
+            "timeout_sec": JOB_TIMEOUT_SEC}
     if status == "queued":
         view["queue_position"] = db.queue_position(job["id"])
     if status == "processing" and time.time() - job["created_at"] > JOB_TIMEOUT_SEC + 30:
@@ -133,9 +147,14 @@ def get_job(job_id: str):
 
 @app.get("/health")
 def health():
-    return {"status": "ok" if worker.state["ready"] else "degraded",
-            "analyzer": worker.state["analyzer"], "analyzer_ready": worker.state["ready"],
-            "analyzer_error": worker.state["error"]}
+    analyzer = worker.snapshot()
+    return {"status": "ok" if analyzer["ready"] else "degraded",
+            "analyzer": analyzer["analyzer"], "analyzer_ready": analyzer["ready"],
+            "analyzer_state": analyzer["status"], "analyzer_error": analyzer["error"],
+            "model_name": analyzer["model_name"], "rule_count": analyzer["rule_count"],
+            "rules": analyzer["rules"], "limitations": analyzer["limitations"],
+            "web_upload_enabled": WEB_UPLOAD_ENABLED,
+            "max_upload_mb": MAX_UPLOAD_MB, "job_timeout_sec": JOB_TIMEOUT_SEC}
 
 
 # ---------- Веб-интерфейс (без ключа в браузере) ----------
