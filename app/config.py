@@ -5,7 +5,6 @@ ROOT = Path(__file__).resolve().parent.parent
 
 API_KEY = os.getenv("CASHLENS_API_KEY", "dev-key")
 DATA_DIR = Path(os.getenv("CASHLENS_DATA_DIR", ROOT / "data"))
-RULES_PATH = Path(os.getenv("CASHLENS_RULES", ROOT / "rules" / "rules.json"))
 WEB_DIR = ROOT / "web"
 
 MAX_UPLOAD_MB = int(os.getenv("CASHLENS_MAX_UPLOAD_MB", "300"))

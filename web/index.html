@@ -26,6 +26,9 @@
     </section>
 
     <section id="result" hidden>
+      <div id="demo" class="demo" hidden>
+        Демо-режим: модель не подключена, результат сгенерирован заглушкой и не отражает содержимое видео.
+      </div>
       <div id="verdict" class="verdict"></div>
       <div class="card">
         <video id="player" controls muted playsinline></video>
@@ -41,14 +44,12 @@
       <div class="event-head">
         <button class="timecode" type="button"></button>
         <h3 class="type"></h3>
-        <span class="confidence muted"></span>
       </div>
       <p class="description"></p>
       <div class="frames"></div>
       <div class="rule">
-        <strong>Требование:</strong> <span class="requirement"></span><br>
-        <strong>Источник:</strong> <a class="source" target="_blank" rel="noopener"></a>
-        <span class="unverified" hidden>не проверено</span>
+        <strong>Источник:</strong> <span class="doc"></span>, <span class="section"></span><br>
+        <a class="source" target="_blank" rel="noopener"></a>
       </div>
     </article>
   </template>

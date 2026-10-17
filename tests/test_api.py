@@ -81,18 +81,26 @@ def test_result_schema(client, video, monkeypatch):
     with open(video, "rb") as f:
         r = client.post("/api/v1/analyze", headers=KEY, files={"file": ("sample.mov", f)})
     job = _wait(client, r.json()["job_id"])
+    assert {"job_id", "status", "verdict", "violations"} <= job.keys()
     assert job["verdict"] == "violation"
     v = job["violations"][0]
     assert isinstance(v["type"], str) and v["type"]
     assert isinstance(v["timecode_sec"], float)
-    assert v["description"]
+    assert "Основание:" in v["description"]  # источник дописан адаптером AI-модуля
     assert 1 <= len(v["evidence_frames"]) <= 3
     first = v["evidence_frames"][0]
     assert first["timestamp_sec"] == v["timecode_sec"]
     assert base64.b64decode(first["image_base64"])[:2] == b"\xff\xd8"  # JPEG
+    assert job["analyzer"] == "mock"
 
     web = client.get(f"/web/jobs/{job['job_id']}").json()
+    assert web["violations"][0]["source"]["url"].startswith("https://")
     assert client.get(web["violations"][0]["evidence_frames"][0]["url"]).status_code == 200
+
+
+def test_health_reports_analyzer(client):
+    h = client.get("/health").json()
+    assert h["analyzer"] == "mock" and h["analyzer_ready"] is True
 
 
 def test_db_not_served(client):

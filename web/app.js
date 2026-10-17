@@ -99,6 +99,7 @@ function seek(sec) {
 function render(job) {
   const ok = job.verdict === "no_violation";
   const items = job.violations;
+  $("demo").hidden = job.analyzer !== "mock";
   const verdict = $("verdict");
   verdict.className = `verdict ${ok ? "ok" : "bad"}`;
   verdict.textContent = ok
@@ -117,8 +118,7 @@ function render(job) {
   const duration = job.duration_sec || 1;
   items.forEach((ev) => {
     const bar = document.createElement("span");
-    bar.style.left = `${(ev.start_sec / duration) * 100}%`;
-    bar.style.width = `${((ev.end_sec - ev.start_sec) / duration) * 100}%`;
+    bar.style.left = `calc(${(ev.timecode_sec / duration) * 100}% - 3px)`;
     bar.title = `${fmt(ev.timecode_sec)} — ${ev.type}`;
     bar.onclick = () => seek(ev.timecode_sec);
     timeline.append(bar);
@@ -133,9 +133,6 @@ function render(job) {
     tc.textContent = fmt(ev.timecode_sec);
     tc.onclick = () => seek(ev.timecode_sec);
     node.querySelector(".type").textContent = ev.type;
-    if (ev.confidence != null) {
-      node.querySelector(".confidence").textContent = `уверенность ${Math.round(ev.confidence * 100)}%`;
-    }
     node.querySelector(".description").textContent = ev.description;
     const frames = node.querySelector(".frames");
     ev.evidence_frames.forEach((f) => {
@@ -149,11 +146,11 @@ function render(job) {
       fig.append(img, cap);
       frames.append(fig);
     });
-    node.querySelector(".requirement").textContent = ev.rule.requirement || "—";
-    const src = node.querySelector(".source");
-    src.textContent = ev.rule.source;
-    if (ev.rule.url) src.href = ev.rule.url; else src.removeAttribute("href");
-    node.querySelector(".unverified").hidden = ev.rule.verified;
+    node.querySelector(".doc").textContent = ev.source.document;
+    node.querySelector(".section").textContent = ev.source.section;
+    const link = node.querySelector(".source");
+    link.href = ev.source.url;
+    link.textContent = ev.source.url;
     list.append(node);
   });
 

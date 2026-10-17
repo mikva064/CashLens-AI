@@ -1,18 +1,36 @@
-"""Точка подключения анализатора. Сервис вызывает только get_analyzer()."""
+"""Подключение AI-модуля cashlens_ai к сервису.
+
+Сервис работает с одним интерфейсом:
+
+    analyzer.load()                                   # один раз, до приёма задач
+    analyzer.analyze(video, output_dir, deadline_sec) -> cashlens_ai.AnalysisResult
+
+CASHLENS_ANALYZER:
+  model — локальная Qwen-модель (src/cashlens_ai), нужны веса и проверенные правила;
+  mock  — демо-заглушка для разработки интерфейса, ничего не распознаёт.
+"""
 
 import os
-from typing import Callable
+from pathlib import Path
+from typing import Protocol
 
-AnalyzeFn = Callable[[str, float], dict]
+from cashlens_ai.contracts import AnalysisResult
 
 
-def get_analyzer() -> AnalyzeFn:
+class Analyzer(Protocol):
+    name: str
+
+    def load(self) -> None: ...
+
+    def analyze(self, video: Path, output_dir: Path, deadline_sec: float) -> AnalysisResult: ...
+
+
+def get_analyzer() -> Analyzer:
     name = os.getenv("CASHLENS_ANALYZER", "mock")
     if name == "mock":
-        from analyzer.mock import analyze_video
-        return analyze_video
+        from analyzer.mock import MockAnalyzer
+        return MockAnalyzer()
     if name == "model":
-        # Модуль человека 1: analyzer/model.py с функцией analyze_video(path, deadline_sec).
-        from analyzer.model import analyze_video
-        return analyze_video
+        from analyzer.qwen import QwenAnalyzer
+        return QwenAnalyzer()
     raise ValueError(f"Неизвестный анализатор: {name}")
