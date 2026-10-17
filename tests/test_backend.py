@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from cashlens_ai.backend import (COARSE_DESCRIPTION, DESCRIPTION_MAX_CHARS, MAX_WINDOW_EVENTS,
+                                 MAX_FINE_PROOF_BRANCHES,
                                  LocalQwenBackend, _StopAfterJsonObject, _build_output_schema,
                                  _GpuDutyPacer, _build_prompt, _expand_wire_response,
                                  _has_complete_json_object)
@@ -234,10 +235,10 @@ class BackendTests(unittest.TestCase):
         transformers._lmfe_integration.build_token_enforcer_tokenizer_data.assert_called_once()
         self.assertEqual(transformers._lmfe.JsonSchemaParser.call_count, 2)
         schema = transformers._lmfe.JsonSchemaParser.call_args.args[0]
-        times = schema["properties"]["e"]["items"]["properties"]["f"]
-        self.assertEqual(times["enum"], [1])
+        branches = schema["properties"]["e"]["items"]["anyOf"]
+        self.assertEqual([branch["properties"]["f"]["enum"] for branch in branches], [[1]])
         self.assertEqual(schema["properties"]["e"]["maxItems"], 3)
-        self.assertEqual(set(schema["properties"]["e"]["items"]["properties"]), {"k", "b", "f", "a", "c"})
+        self.assertEqual(set(branches[0]["properties"]), {"k", "b", "f", "a", "c"})
 
     def test_generation_diagnostics_contain_only_safe_metadata(self):
         torch, transformers, model, processor, _ = self.fake_dependencies()
@@ -443,6 +444,14 @@ class CompactWireTests(unittest.TestCase):
             _expand_wire_response(json.dumps({"e":[events[0]]*2}), rules, [10.,11.,12.,13.,14.],
                 "fine", candidate_timecodes_sec=[11.], candidate_radius_sec=0.2)
 
+    def test_fine_schema_budget_accepts_profiles_and_rejects_excessive_context(self):
+        schema = _build_output_schema(RULES, [float(index) for index in range(12)], "fine",
+                                      candidate_timecode_sec=6., candidate_radius_sec=20.)
+        self.assertLessEqual(len(schema["properties"]["e"]["items"]["anyOf"]), MAX_FINE_PROOF_BRANCHES)
+        with self.assertRaisesRegex(ValueError, "branch budget"):
+            _build_output_schema(RULES, [float(index) for index in range(100)], "fine",
+                                 candidate_timecode_sec=50., candidate_radius_sec=100.)
+
 
 class JsonStoppingTests(unittest.TestCase):
     def test_complete_first_object_ends_generation(self):
@@ -542,6 +551,38 @@ class ConstrainedSchemaTests(unittest.TestCase):
         self.assertTrue(self.accepts(json.dumps({"e":[event]}), "fine"))
         self.assertFalse(self.accepts(json.dumps({"e":[event]*4}), "fine"))
         self.assertFalse(self.accepts(json.dumps({"e":[{**event,"d":"not allowed"}]}), "fine"))
+
+    def test_actual_fine_grammar_enforces_order_cash_context_and_each_focus(self):
+        self.schemas["fine"] = _build_output_schema(RULES, [float(index) for index in range(6)], "fine",
+            candidate_timecodes_sec=[1., 4.], candidate_radius_sec=0.1)
+        for event in ({"k":"demo_rule", "b":0,"f":1,"a":5,"c":0},
+                      {"k":"demo_rule", "b":2,"f":4,"a":5,"c":4},
+                      {"k":"demo_rule", "b":0,"f":4,"a":5,"c":5}):
+            with self.subTest(event=event):
+                self.assertTrue(self.accepts(json.dumps({"e":[event]}), "fine"))
+        valid = {"k":"demo_rule", "b":0,"f":1,"a":5,"c":0}
+        for event in ({**valid,"b":1}, {**valid,"b":3}, {**valid,"a":0},
+                      {**valid,"a":1}, {**valid,"c":2}, {**valid,"f":3},
+                      {**valid,"b":False}, {**valid,"f":1.0}, {**valid,"a":6}):
+            with self.subTest(event=event):
+                self.assertFalse(self.accepts(json.dumps({"e":[event]}), "fine"))
+
+    def test_actual_fine_grammar_prevents_cross_branch_cash_mixing_and_multi_digit_confusion(self):
+        self.schemas["fine"] = _build_output_schema(RULES, [float(index) for index in range(12)], "fine",
+            candidate_timecodes_sec=[3., 10.], candidate_radius_sec=0.1)
+        for event in ({"k":"demo_rule", "b":1,"f":3,"a":11,"c":11},
+                      {"k":"demo_rule", "b":9,"f":10,"a":11,"c":9}):
+            self.assertTrue(self.accepts(json.dumps({"e":[event]}), "fine"))
+        # c=2 appears in other valid tuples, but not in this selected tuple.
+        wrong = {"k":"demo_rule", "b":1,"f":3,"a":11,"c":2}
+        self.assertFalse(self.accepts(json.dumps({"e":[wrong]}), "fine"))
+        self.assertFalse(self.accepts('{"e":[{"k":"demo_rule","b":9,"f":1,"a":11,"c":9}]}', "fine"))
+
+    def test_actual_fine_grammar_excludes_duplicate_source_times(self):
+        self.schemas["fine"] = _build_output_schema(RULES, [0., 1., 1., 2.], "fine",
+            candidate_timecode_sec=1., candidate_radius_sec=0.1)
+        self.assertTrue(self.accepts('{"e":[{"k":"demo_rule","b":0,"f":1,"a":3,"c":1}]}', "fine"))
+        self.assertFalse(self.accepts('{"e":[{"k":"demo_rule","b":0,"f":1,"a":2,"c":1}]}', "fine"))
 
     def test_coarse_description_cannot_be_generated(self):
         event = self.event(description="Произвольное описание кандидата")

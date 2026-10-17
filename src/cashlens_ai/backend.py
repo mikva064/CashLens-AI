@@ -22,6 +22,8 @@ if TYPE_CHECKING:
     from .video import SampledFrame
 
 MAX_WINDOW_EVENTS = 3
+MAX_FINE_PROOF_BRANCHES = 512
+MAX_FINE_SCHEMA_FRAMES = 64
 DESCRIPTION_MAX_CHARS = 96
 COARSE_DESCRIPTION = "Кандидат для уточнения"
 log = logging.getLogger("cashlens.model")
@@ -70,22 +72,46 @@ def _build_output_schema(rules: list[dict[str, str]], timestamps: list[float],
                          candidate_timecodes_sec: list[float] | None = None) -> dict:
     if phase not in {"coarse", "fine"} or not rules or not timestamps:
         raise ValueError("A valid phase, categories and supplied frames are required")
+    if phase == "fine" and len(timestamps) > MAX_FINE_SCHEMA_FRAMES:
+        raise ValueError("Fine proof schema exceeds the supported branch budget (too many frames)")
     keys = list(_category_map(rules))
     indices = list(range(len(timestamps)))
     focus = (indices if phase == "coarse" else _fine_focus_indices(
         timestamps, candidate_timecode_sec, candidate_radius_sec,
         candidate_timecodes_sec=candidate_timecodes_sec))
-    properties = {"k": {"type": "string", "enum": keys}}
-    if phase == "fine":
-        properties["b"] = {"type": "integer", "enum": indices}
-    properties["f"] = {"type": "integer", "enum": focus or indices}
-    if phase == "fine":
-        properties.update({key: {"type": "integer", "enum": indices} for key in ("a", "c")})
+    if phase == "coarse":
+        properties = {"k": {"type": "string", "enum": keys},
+                      "f": {"type": "integer", "enum": indices}}
+        item_schema = {"type": "object", "additionalProperties": False,
+                       "required": list(properties), "properties": properties}
+        max_events = MAX_WINDOW_EVENTS
+    else:
+        # Each branch is one valid proof tuple. Independent index enums cannot
+        # express the ordering or cash-context relation during token decoding.
+        choices = [(action,
+                    [before for before in range(action) if timestamps[before] < timestamps[action]],
+                    [after for after in range(action + 1, len(timestamps))
+                     if timestamps[action] < timestamps[after]]) for action in focus]
+        if sum(len(before) * len(after) for _, before, after in choices) > MAX_FINE_PROOF_BRANCHES:
+            raise ValueError("Fine proof schema exceeds the supported branch budget")
+        branches = []
+        for action, before_indices, after_indices in choices:
+            for before in before_indices:
+                for after in after_indices:
+                    properties = {"k": {"type": "string", "enum": keys},
+                                  "b": {"type": "integer", "enum": [before]},
+                                  "f": {"type": "integer", "enum": [action]},
+                                  "a": {"type": "integer", "enum": [after]},
+                                  "c": {"type": "integer", "enum": [before, action, after]}}
+                    branches.append({"type": "object", "additionalProperties": False,
+                                     "required": list(properties), "properties": properties})
+        # No-focus calls return before model generation. Keep a valid schema for
+        # strict post-validation instead of the invalid JSON Schema anyOf:[].
+        item_schema = {"anyOf": branches} if branches else {"type": "object"}
+        max_events = MAX_WINDOW_EVENTS if branches else 0
     return {"type": "object", "additionalProperties": False, "required": ["e"],
             "properties": {"e": {"type": "array", "minItems": 0,
-                "maxItems": MAX_WINDOW_EVENTS if focus else 0,
-                "items": {"type": "object", "additionalProperties": False,
-                          "required": list(properties), "properties": properties}}}}
+                "maxItems": max_events, "items": item_schema}}}
 
 
 def _expand_wire_response(text: str, rules: list[dict[str, str]], timestamps: list[float],
