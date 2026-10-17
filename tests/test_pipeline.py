@@ -208,6 +208,31 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(fine_times, [0.8, 1.0, 2.0, 2.2])
         self.assertEqual(len(fine_times), config.max_refine_frames)
 
+    def test_same_rule_candidates_from_one_context_share_one_fine_call(self):
+        coarse_calls = 0
+
+        def detect(phase, frames, rules):
+            nonlocal coarse_calls
+            if phase == "coarse":
+                coarse_calls += 1
+                return (response(event(0.2), event(0.6), event(1.0))
+                        if coarse_calls == 1 else response())
+            return response(event(0.73))
+
+        # Keep the three coarse anchors separate so only context deduplication
+        # can prevent repeated fine inference on their identical rule/window.
+        config = replace(self.config, merge_sec=0.05)
+        backend = RecordingBackend(detect)
+        result = VideoAnalyzer(backend, [self.rule], config=config).analyze(
+            self.video, self.root / "job")
+        fine_calls = [call for call in backend.calls if call["phase"] == "fine"]
+        self.assertEqual(len(fine_calls), 1)
+        self.assertEqual(result.verdict, "violation")
+        self.assertEqual(len(result.violations), 1)
+        self.assertEqual(result.violations[0].rule_id, self.rule.id)
+        self.assertAlmostEqual(result.violations[0].timecode_sec, 0.8, places=6)
+        self.assertEqual(result.violations[0].source, self.rule.source)
+
     def test_unknown_rule_out_of_range_or_malformed_output_fails(self):
         bad_outputs = (
             response(event(0.6, rule_id="unknown_event")),

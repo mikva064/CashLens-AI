@@ -13,8 +13,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from cashlens_ai.backend import (DESCRIPTION_MAX_CHARS, MAX_WINDOW_EVENTS, LocalQwenBackend,
-                                 _StopAfterJsonObject, _build_output_schema, _has_complete_json_object)
+from cashlens_ai.backend import (COARSE_DESCRIPTION, DESCRIPTION_MAX_CHARS, MAX_WINDOW_EVENTS,
+                                 LocalQwenBackend, _StopAfterJsonObject, _build_output_schema,
+                                 _build_prompt, _has_complete_json_object)
 from cashlens_ai.errors import ModelUnavailableError, RuleValidationError
 
 
@@ -141,7 +142,7 @@ class BackendTests(unittest.TestCase):
         event_properties = schema["properties"]["events"]["items"]["properties"]
         self.assertEqual(event_properties["rule_id"]["enum"], ["demo_rule"])
         self.assertEqual(event_properties["timecode_sec"]["enum"], [10.25, 11.5])
-        self.assertEqual(event_properties["description"]["maxLength"], 160)
+        self.assertEqual(event_properties["description"]["enum"], [COARSE_DESCRIPTION])
         self.assertIn("Я", schema_call.kwargs["config"].alphabet)
         self.assertTrue(schema_call.kwargs["config"].force_json_field_order)
         self.assertIs(transformers._lmfe.JsonSchemaParser.return_value.config,
@@ -222,6 +223,34 @@ class BackendTests(unittest.TestCase):
         schema = transformers._lmfe.JsonSchemaParser.call_args.args[0]
         times = schema["properties"]["events"]["items"]["properties"]["timecode_sec"]
         self.assertEqual(times["enum"], [20.5])
+        self.assertEqual(schema["properties"]["events"]["maxItems"], 1)
+        description = schema["properties"]["events"]["items"]["properties"]["description"]
+        self.assertEqual(description["maxLength"], 96)
+        self.assertNotIn("enum", description)
+
+    def test_generation_diagnostics_contain_only_safe_metadata(self):
+        torch, transformers, model, processor, _ = self.fake_dependencies()
+        processor.batch_decode.return_value = ['{"events":[{"description":"PRIVATE OUTPUT"}']
+        model.generate.return_value.__getitem__.return_value.shape = (1, 384)
+        with patch.dict(sys.modules, self.dependency_modules(torch, transformers)), patch.dict(os.environ):
+            with self.assertLogs("cashlens.model", level="INFO") as logs:
+                self.backend.describe(self.frames, RULES)
+        diagnostic = " ".join(logs.output)
+        self.assertIn("phase=coarse nframes=2 generated_tokens=384", diagnostic)
+        self.assertIn("complete_json=False", diagnostic)
+        self.assertIn("token_limit=True", diagnostic)
+        self.assertIn("latency_sec=", diagnostic)
+        self.assertNotIn("PRIVATE OUTPUT", diagnostic)
+        self.assertNotIn(self.directory.name, diagnostic)
+
+    def test_prompts_use_bounded_phase_specific_descriptions(self):
+        coarse = _build_prompt(RULES, "coarse")
+        fine = _build_prompt(RULES, "fine")
+        self.assertIn(COARSE_DESCRIPTION, coarse)
+        self.assertIn("Do not narrate or explain candidates", coarse)
+        self.assertIn("at most ONE event", fine)
+        self.assertIn("at most 12 words and 96 characters", fine)
+        self.assertNotIn(COARSE_DESCRIPTION, fine)
 
 
 class JsonStoppingTests(unittest.TestCase):
@@ -284,10 +313,11 @@ class ConstrainedSchemaTests(unittest.TestCase):
         self.config = CharacterLevelParserConfig(max_consecutive_whitespaces=1,
                                                 force_json_field_order=True)
         self.config.alphabet += "".join(chr(code) for code in range(0x0400, 0x0500))
-        self.schema = _build_output_schema(RULES, [10.25, 11.5])
+        self.schemas = {phase: _build_output_schema(RULES, [10.25, 11.5], phase)
+                        for phase in ("coarse", "fine")}
 
-    def accepts(self, text):
-        parser = self.parser_type(self.schema, config=self.config)
+    def accepts(self, text, phase="coarse"):
+        parser = self.parser_type(self.schemas[phase], config=self.config)
         for character in text:
             if character not in parser.get_allowed_characters():
                 return False
@@ -297,7 +327,7 @@ class ConstrainedSchemaTests(unittest.TestCase):
     @staticmethod
     def event(**changes):
         result = {"rule_id": "demo_rule", "timecode_sec": 10.25,
-                  "description": "Тестовое действие."}
+                  "description": COARSE_DESCRIPTION}
         result.update(changes)
         return result
 
@@ -312,6 +342,17 @@ class ConstrainedSchemaTests(unittest.TestCase):
                       self.event(description="x" * (DESCRIPTION_MAX_CHARS + 1))):
             with self.subTest(event=event):
                 self.assertFalse(self.accepts(json.dumps({"events": [event]}, ensure_ascii=False)))
+
+    def test_fine_accepts_one_short_description_and_blocks_long_or_multiple_events(self):
+        event = self.event(description="Тестовое видимое действие.")
+        self.assertTrue(self.accepts(json.dumps({"events": [event]}, ensure_ascii=False), "fine"))
+        self.assertFalse(self.accepts(json.dumps({"events": [event, event]}, ensure_ascii=False), "fine"))
+        event = self.event(description="x" * (DESCRIPTION_MAX_CHARS + 1))
+        self.assertFalse(self.accepts(json.dumps({"events": [event]}, ensure_ascii=False), "fine"))
+
+    def test_coarse_description_is_fixed_instead_of_generated_narrative(self):
+        event = self.event(description="Произвольное описание кандидата")
+        self.assertFalse(self.accepts(json.dumps({"events": [event]}, ensure_ascii=False)))
 
     def test_maximum_array_length_and_unknown_legal_field_are_blocked(self):
         self.assertFalse(self.accepts(json.dumps({"events": [self.event()] * (MAX_WINDOW_EVENTS + 1)})))

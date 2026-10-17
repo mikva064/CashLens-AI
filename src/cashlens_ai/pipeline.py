@@ -174,9 +174,16 @@ class VideoAnalyzer:
         candidates = merge_events(candidates, config.merge_sec)
 
         confirmed: list[ModelEvent] = []
+        refined_contexts: set[tuple[str, float, float]] = set()
         for event in candidates:
             remaining()
             first_sec, last_sec = candidate_context[(event.rule_id, event.timecode_sec)]
+            context_key = (event.rule_id, first_sec, last_sec)
+            if context_key in refined_contexts:
+                continue
+            # Fine analysis examines the whole context for this rule. Several
+            # coarse anchors from that exact window would repeat identical work.
+            refined_contexts.add(context_key)
             # Verification must retain the before/after context that produced
             # the candidate, including service/transaction boundaries.
             start = max(0.0, first_sec - config.refine_radius_sec)

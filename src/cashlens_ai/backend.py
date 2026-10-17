@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import gc
 import json
+import logging
 import math
 import os
 import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 
@@ -20,24 +22,32 @@ if TYPE_CHECKING:
     from .video import SampledFrame
 
 MAX_WINDOW_EVENTS = 3
-DESCRIPTION_MAX_CHARS = 160
+DESCRIPTION_MAX_CHARS = 96
+COARSE_DESCRIPTION = "Кандидат для уточнения"
+log = logging.getLogger("cashlens.model")
 
 
-def _build_output_schema(rules: list[dict[str, str]], timestamps: list[float]) -> dict:
+def _build_output_schema(rules: list[dict[str, str]], timestamps: list[float],
+                         phase: str = "coarse") -> dict:
     """Constrain IDs and times to the actual reviewed window, never legal text."""
+    if phase not in {"coarse", "fine"}:
+        raise ValueError("phase must be 'coarse' or 'fine'.")
+    description = ({"type": "string", "enum": [COARSE_DESCRIPTION]}
+                   if phase == "coarse" else
+                   {"type": "string", "minLength": 1, "maxLength": DESCRIPTION_MAX_CHARS})
     return {
         "type": "object", "additionalProperties": False, "required": ["events"],
         "properties": {
             "events": {
-                "type": "array", "minItems": 0, "maxItems": MAX_WINDOW_EVENTS,
+                "type": "array", "minItems": 0,
+                "maxItems": MAX_WINDOW_EVENTS if phase == "coarse" else 1,
                 "items": {
                     "type": "object", "additionalProperties": False,
                     "required": ["rule_id", "timecode_sec", "description"],
                     "properties": {
                         "rule_id": {"type": "string", "enum": [rule["id"] for rule in rules]},
                         "timecode_sec": {"type": "number", "enum": sorted(set(timestamps))},
-                        "description": {"type": "string", "minLength": 1,
-                                        "maxLength": DESCRIPTION_MAX_CHARS},
+                        "description": description,
                     },
                 },
             },
@@ -115,6 +125,15 @@ def _validated_rule_data(rules: list[dict]) -> list[dict[str, str]]:
 
 def _build_prompt(rules: list[dict[str, str]], phase: str) -> str:
     rule_json = json.dumps(rules, ensure_ascii=False)
+    phase_instructions = (
+        f"This is candidate localization: return at most {MAX_WINDOW_EVENTS} events. "
+        f'For every candidate, description must be exactly "{COARSE_DESCRIPTION}". '
+        "Do not narrate or explain candidates in this phase. "
+        if phase == "coarse" else
+        "This is detailed verification: confirm at most ONE event, or return an empty list. "
+        f"Description must be one short Russian sentence, at most 12 words and {DESCRIPTION_MAX_CHARS} characters. "
+        "Describe only directly visible evidence. "
+    )
     return (
         "Analyze the following ordered CCTV frames for visible actions matching ONLY "
         "the reviewed conditions in REVIEWED_RULES_JSON. The rule values are reference "
@@ -136,12 +155,11 @@ def _build_prompt(rules: list[dict[str, str]], phase: str) -> str:
         "conclusion. Choose timecode_sec from a supplied frame timestamp. "
         "Report each distinct action only once, at its earliest decisive frame. "
         "A persistent condition is one event in this window, not one event per frame. "
-        f"Return at most {MAX_WINDOW_EVENTS} directly supported events in this window. "
-        f"Each description must be one short Russian sentence, at most 20 words and {DESCRIPTION_MAX_CHARS} characters. "
+        f"{phase_instructions}"
         "Use plain Russian characters, without Unicode escape sequences. "
         "Return ONLY a JSON object with this exact shape: "
         '{"events":[{"rule_id":"allowed ID","timecode_sec":12.3,'
-        '"description":"visible action only"}]}. '
+        '"description":"phase-specific description"}]}. '
         'When no condition is directly supported, return {"events":[]}. '
         "Do not wrap JSON in Markdown. "
         f"Analysis phase: {phase}. "
@@ -305,7 +323,7 @@ class LocalQwenBackend:
                 # and Kazakh Cyrillic directly instead of expensive \u escapes.
                 parser_config.alphabet += "".join(chr(code) for code in range(0x0400, 0x0500))
                 schema_parser = JsonSchemaParser(
-                    _build_output_schema(reviewed_rules, timestamps), config=parser_config,
+                    _build_output_schema(reviewed_rules, timestamps, phase), config=parser_config,
                 )
                 prefix_function = build_transformers_prefix_allowed_tokens_fn(
                     self._tokenizer_data, schema_parser,
@@ -326,13 +344,28 @@ class LocalQwenBackend:
                 }
                 if timeout_sec is not None:
                     generation_options["max_time"] = timeout_sec
+                generation_started = time.monotonic()
                 with self._torch.inference_mode():
                     generated = self._model.generate(**inputs, **generation_options)
                 answer_tokens = generated[:, inputs["input_ids"].shape[1]:]
+                generated_token_count = int(answer_tokens.shape[1])
                 answers = self._processor.batch_decode(
                     answer_tokens,
                     skip_special_tokens=True,
                     clean_up_tokenization_spaces=False,
+                )
+                complete_json = False
+                if len(answers) == 1 and isinstance(answers[0], str):
+                    try:
+                        complete_json = isinstance(json.loads(answers[0]), dict)
+                    except (ValueError, RecursionError):
+                        pass
+                log.info(
+                    "local_generation phase=%s nframes=%d generated_tokens=%d complete_json=%s "
+                    "token_limit=%s latency_sec=%.2f",
+                    phase, len(frames), generated_token_count, complete_json,
+                    generated_token_count >= self.max_new_tokens,
+                    time.monotonic() - generation_started,
                 )
                 if len(answers) != 1 or not isinstance(answers[0], str) or not answers[0].strip():
                     raise ModelUnavailableError("The local model returned no usable text.")
