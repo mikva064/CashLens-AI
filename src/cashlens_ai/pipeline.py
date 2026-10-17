@@ -7,17 +7,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol, Sequence
 
-from pydantic import Field, ValidationError
+from pydantic import Field, StrictFloat, ValidationError
 
 from .contracts import AnalysisResult, EvidenceFrame, Rule, StrictModel, Violation
 from .errors import AnalysisTimeoutError, InvalidModelOutputError, RuleValidationError, VideoReadError
-from .video import SampledFrame, get_frame_at, get_frames_at, iter_sampled_frames, probe_video
+from .video import SampledFrame, get_frames_at, iter_sampled_frames, probe_video
 
 
 class ModelEvent(StrictModel):
     rule_id: str
     timecode_sec: float = Field(ge=0)
     description: str = Field(min_length=1, max_length=1600)
+    evidence_timestamps_sec: list[StrictFloat] | None = Field(default=None, min_length=3, max_length=3)
+    cash_context_timestamp_sec: StrictFloat | None = Field(default=None, ge=0)
 
 
 class ModelResponse(StrictModel):
@@ -26,7 +28,9 @@ class ModelResponse(StrictModel):
 
 class WindowBackend(Protocol):
     def describe(self, frames: Sequence[SampledFrame], rules: list[dict], *,
-                 phase: str = "coarse", timeout_sec: float | None = None) -> str: ...
+                 phase: str = "coarse", timeout_sec: float | None = None,
+                 candidate_timecode_sec: float | None = None,
+                 candidate_radius_sec: float | None = None) -> str: ...
 
 
 @dataclass(frozen=True)
@@ -57,7 +61,11 @@ class AnalyzerConfig:
 
 
 def parse_model_response(text: str, *, allowed_ids: set[str],
-                         first_sec: float, last_sec: float) -> list[ModelEvent]:
+                         first_sec: float, last_sec: float,
+                         require_proof: bool = False,
+                         frame_timestamps: Sequence[float] | None = None,
+                         candidate_timecode_sec: float | None = None,
+                         candidate_radius_sec: float | None = None) -> list[ModelEvent]:
     text = text.strip()
     if text.startswith("```"):
         lines = text.splitlines()
@@ -76,11 +84,24 @@ def parse_model_response(text: str, *, allowed_ids: set[str],
         result = ModelResponse.model_validate(data)
     except (ValueError, ValidationError) as exc:
         raise InvalidModelOutputError("Model response is not valid event JSON") from exc
+    if require_proof and len(result.events) > 1:
+        raise InvalidModelOutputError("Fine verification permits at most one grounded event")
     for event in result.events:
         if event.rule_id not in allowed_ids:
             raise InvalidModelOutputError("Model returned an unknown rule ID")
         if not first_sec - 0.001 <= event.timecode_sec <= last_sec + 0.001:
             raise InvalidModelOutputError("Model timestamp is outside the supplied frames")
+        if require_proof:
+            proof = event.evidence_timestamps_sec
+            if (proof is None or frame_timestamps is None
+                    or any(timestamp not in frame_timestamps for timestamp in proof)
+                    or not proof[0] < proof[1] < proof[2]
+                    or event.timecode_sec != proof[1]
+                    or event.cash_context_timestamp_sec not in proof):
+                raise InvalidModelOutputError("Fine verification requires ordered source-frame proof and cash context")
+            if (candidate_timecode_sec is None or candidate_radius_sec is None
+                    or abs(event.timecode_sec - candidate_timecode_sec) > candidate_radius_sec + 1e-9):
+                raise InvalidModelOutputError("Fine action is outside the original candidate focus")
     return result.events
 
 
@@ -128,15 +149,20 @@ class VideoAnalyzer:
         output = Path(output_dir).resolve()
         output.mkdir(parents=True, exist_ok=False)
 
-        def analyze_window(frames, rules, phase):
+        def analyze_window(frames, rules, phase, *, candidate=None):
+            focus = ({"candidate_timecode_sec": candidate.timecode_sec,
+                      "candidate_radius_sec": config.refine_radius_sec}
+                     if candidate is not None else {})
             raw = self.backend.describe(
                 frames, [r.model_dump(mode="json") for r in rules],
-                phase=phase, timeout_sec=remaining(),
+                phase=phase, timeout_sec=remaining(), **focus,
             )
             remaining()
             return parse_model_response(
                 raw, allowed_ids={r.id for r in rules},
                 first_sec=frames[0].timestamp_sec, last_sec=frames[-1].timestamp_sec,
+                require_proof=phase == "fine",
+                frame_timestamps=[frame.timestamp_sec for frame in frames], **focus,
             )
 
         frames_per_window = max(2, round(config.window_sec * config.sample_fps))
@@ -208,26 +234,22 @@ class VideoAnalyzer:
             frames = get_frames_at(info.path, [*required, *optional], max_edge=config.refine_max_edge)
             if not frames:
                 raise InvalidModelOutputError("Cannot verify the proposed event window")
-            confirmed.extend(analyze_window(frames, [self.rules[event.rule_id]], "fine"))
+            confirmed.extend(analyze_window(frames, [self.rules[event.rule_id]], "fine", candidate=event))
 
         violations = []
         for index, event in enumerate(merge_events(confirmed, config.merge_sec), 1):
             remaining()
             rule = self.rules[event.rule_id]
             evidence = []
-            seen = set()
-            anchor = get_frame_at(info.path, event.timecode_sec)
-            for offset in (-0.5, 0.0, 0.5):
-                frame = anchor if offset == 0 else get_frame_at(
-                    info.path, min(info.duration_sec, max(0.0, anchor.timestamp_sec + offset)))
-                if frame.timestamp_sec in seen:
-                    continue
-                seen.add(frame.timestamp_sec)
+            proof_frames = get_frames_at(info.path, event.evidence_timestamps_sec)
+            if [frame.timestamp_sec for frame in proof_frames] != event.evidence_timestamps_sec:
+                raise InvalidModelOutputError("Cannot recover the exact verified proof frames")
+            for frame in proof_frames:
                 path = output / f"event_{index:03d}_{len(evidence) + 1}.jpg"
                 frame.image.save(path, format="JPEG", quality=92)
                 evidence.append(EvidenceFrame(timestamp_sec=frame.timestamp_sec, image_path=path))
             violations.append(Violation(
-                type=rule.title, timecode_sec=anchor.timestamp_sec,
+                type=rule.title, timecode_sec=event.timecode_sec,
                 description=event.description, rule_id=rule.id, source=rule.source,
                 evidence_frames=evidence,
             ))

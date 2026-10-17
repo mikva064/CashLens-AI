@@ -3,6 +3,7 @@
 import contextlib
 import json
 import logging
+import queue
 import threading
 import time
 from pathlib import Path
@@ -64,6 +65,46 @@ class StubModel:
         self.closed = True
 
 
+class InlineProcess:
+    """Unit-test transport only; actual kill/restart tests use a spawned process."""
+    def __init__(self, model):
+        self.model = model
+        self.messages = queue.Queue()
+        self.closed = False
+
+    def start(self):
+        def load():
+            try:
+                self.model.load()
+                self.messages.put({"kind": "ready", "analyzer": self.model.name,
+                                   "capabilities": self.model.capabilities()})
+            except Exception as exc:
+                self.messages.put(worker._error_message(exc, loading=True))
+        threading.Thread(target=load, daemon=True).start()
+
+    def send(self, command):
+        def analyze():
+            try:
+                path = worker._execute_job(self.model, command)
+                self.messages.put({"kind": "done", "job_id": command["job_id"], "result_path": str(path)})
+            except Exception as exc:
+                self.messages.put(worker._error_message(exc, command["job_id"]))
+        threading.Thread(target=analyze, daemon=True).start()
+
+    def poll(self, timeout=0):
+        try:
+            return self.messages.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def is_alive(self):
+        return not self.closed
+
+    def close(self):
+        self.closed = True
+        self.model.close()
+
+
 @pytest.fixture
 def service(monkeypatch, tmp_path):
     jobs = tmp_path / "jobs"
@@ -76,7 +117,7 @@ def service(monkeypatch, tmp_path):
 
     @contextlib.contextmanager
     def run(model):
-        monkeypatch.setattr(worker, "get_analyzer", lambda: model)
+        monkeypatch.setattr(worker, "_new_process", lambda: InlineProcess(model))
         with TestClient(main.app) as client:
             yield client, jobs
         assert model.closed
@@ -227,6 +268,24 @@ def test_upload_limit_cleanup(service, monkeypatch):
         wait_state(client, "ready")
         assert upload(client).status_code == 413
         assert list(jobs.iterdir()) == []
+
+
+def test_upload_cannot_queue_after_permanent_failure_drain(service, monkeypatch):
+    with service(StubModel()) as (client, _):
+        wait_state(client, "ready")
+        monkeypatch.setattr(db, "claim_next", lambda: None)
+
+        def fail_during_probe(_):
+            worker._update(ready=False, status="failed", error="Synthetic unavailable model")
+            db.fail_outstanding("Synthetic unavailable model", code="model_unavailable")
+            return 2.0
+
+        monkeypatch.setattr(main.media, "probe_duration", fail_during_probe)
+        response = upload(client)
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "failed" and body["failure_code"] == "model_unavailable"
+        assert db.get(body["job_id"])["status"] == "failed"
 
 
 def test_qwen_uses_root_relative_paths_and_offline_backend(monkeypatch, tmp_path):

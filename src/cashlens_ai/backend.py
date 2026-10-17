@@ -27,8 +27,25 @@ COARSE_DESCRIPTION = "Кандидат для уточнения"
 log = logging.getLogger("cashlens.model")
 
 
+def _fine_focus_indices(timestamps: list[float], candidate_timecode_sec: float | None,
+                        candidate_radius_sec: float | None) -> list[int]:
+    for name, value in (("candidate_timecode_sec", candidate_timecode_sec),
+                        ("candidate_radius_sec", candidate_radius_sec)):
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value < 0):
+            raise ValueError(f"Fine verification requires finite nonnegative {name}")
+    if candidate_radius_sec <= 0:
+        raise ValueError("candidate_radius_sec must be positive")
+    if not timestamps[0] - 0.001 <= candidate_timecode_sec <= timestamps[-1] + 0.001:
+        raise ValueError("Candidate must belong to the supplied fine context")
+    return [index for index in range(1, len(timestamps) - 1)
+            if abs(timestamps[index] - candidate_timecode_sec) <= candidate_radius_sec + 1e-9]
+
+
 def _build_output_schema(rules: list[dict[str, str]], timestamps: list[float],
-                         phase: str = "coarse") -> dict:
+                         phase: str = "coarse", *,
+                         candidate_timecode_sec: float | None = None,
+                         candidate_radius_sec: float | None = None) -> dict:
     """Use bounded indices so the model never spends tokens copying IDs/times."""
     if phase not in {"coarse", "fine"}:
         raise ValueError("phase must be 'coarse' or 'fine'.")
@@ -36,17 +53,25 @@ def _build_output_schema(rules: list[dict[str, str]], timestamps: list[float],
         raise ValueError("At least one reviewed rule and supplied frame are required")
     if phase == "fine" and len(rules) != 1:
         raise ValueError("Fine verification requires exactly one reviewed rule")
-    properties = {"f": {"type": "integer", "enum": list(range(len(timestamps)))}}
+    indices = list(range(len(timestamps)))
+    properties = {"f": {"type": "integer", "enum": indices}}
+    focus = indices
     if phase == "coarse":
         properties = {"r": {"type": "integer", "enum": list(range(len(rules)))}, **properties}
     else:
-        properties["d"] = {"type": "string", "minLength": 1, "maxLength": DESCRIPTION_MAX_CHARS}
+        focus = _fine_focus_indices(timestamps, candidate_timecode_sec, candidate_radius_sec)
+        properties = {"b": {"type": "integer", "enum": indices},
+                      "f": {"type": "integer", "enum": focus or indices},
+                      "a": {"type": "integer", "enum": indices},
+                      "c": {"type": "integer", "enum": indices},
+                      "d": {"type": "string", "minLength": 1,
+                            "maxLength": DESCRIPTION_MAX_CHARS}}
     return {
         "type": "object", "additionalProperties": False, "required": ["e"],
         "properties": {
             "e": {
                 "type": "array", "minItems": 0,
-                "maxItems": MAX_WINDOW_EVENTS if phase == "coarse" else 1,
+                "maxItems": MAX_WINDOW_EVENTS if phase == "coarse" else int(bool(focus)),
                 "items": {
                     "type": "object", "additionalProperties": False,
                     "required": list(properties), "properties": properties,
@@ -57,9 +82,13 @@ def _build_output_schema(rules: list[dict[str, str]], timestamps: list[float],
 
 
 def _expand_wire_response(text: str, rules: list[dict[str, str]], timestamps: list[float],
-                          phase: str = "coarse") -> str:
+                          phase: str = "coarse", *,
+                          candidate_timecode_sec: float | None = None,
+                          candidate_radius_sec: float | None = None) -> str:
     """Fail closed and map compact indices to exact trusted IDs and global times."""
-    _build_output_schema(rules, timestamps, phase)
+    _build_output_schema(rules, timestamps, phase,
+                         candidate_timecode_sec=candidate_timecode_sec,
+                         candidate_radius_sec=candidate_radius_sec)
 
     def unique_object(pairs):
         result = {}
@@ -81,7 +110,7 @@ def _expand_wire_response(text: str, rules: list[dict[str, str]], timestamps: li
             raise ValueError("Too many compact events")
         events = []
         for event in parsed["e"]:
-            expected = {"r", "f"} if phase == "coarse" else {"f", "d"}
+            expected = {"r", "f"} if phase == "coarse" else {"b", "f", "a", "c", "d"}
             if type(event) is not dict or set(event) != expected:
                 raise ValueError("Invalid compact event fields")
             frame_index = event["f"]
@@ -94,9 +123,27 @@ def _expand_wire_response(text: str, rules: list[dict[str, str]], timestamps: li
             if (type(description) is not str or not description.strip()
                     or len(description) > DESCRIPTION_MAX_CHARS):
                 raise ValueError("Invalid compact event description")
-            events.append({"rule_id": rules[rule_index]["id"],
-                           "timecode_sec": timestamps[frame_index],
-                           "description": description.strip()})
+            expanded = {"rule_id": rules[rule_index]["id"],
+                        "timecode_sec": timestamps[frame_index],
+                        "description": description.strip()}
+            if phase == "fine":
+                before, after, cash = event["b"], event["a"], event["c"]
+                if any(type(index) is not int or not 0 <= index < len(timestamps)
+                       for index in (before, after, cash)):
+                    raise ValueError("Proof index is outside the supplied frames")
+                if not before < frame_index < after:
+                    raise ValueError("Proof must show ordered before, action and after frames")
+                if not timestamps[before] < timestamps[frame_index] < timestamps[after]:
+                    raise ValueError("Proof must have three distinct increasing source times")
+                if cash not in (before, frame_index, after):
+                    raise ValueError("Cash/service context must be visible in a proof frame")
+                if frame_index not in _fine_focus_indices(
+                        timestamps, candidate_timecode_sec, candidate_radius_sec):
+                    raise ValueError("Fine action is outside the candidate focus")
+                expanded["evidence_timestamps_sec"] = [timestamps[before], timestamps[frame_index],
+                                                       timestamps[after]]
+                expanded["cash_context_timestamp_sec"] = timestamps[cash]
+            events.append(expanded)
         return json.dumps({"events": events}, ensure_ascii=False, separators=(",", ":"))
     except (ValueError, TypeError, KeyError, IndexError, RecursionError) as exc:
         raise InvalidModelOutputError("The model returned invalid compact event JSON") from exc
@@ -210,18 +257,48 @@ def _validated_rule_data(rules: list[dict]) -> list[dict[str, str]]:
     return result
 
 
-def _build_prompt(rules: list[dict[str, str]], phase: str) -> str:
+def _build_prompt(rules: list[dict[str, str]], phase: str, *,
+                  candidate_frame_index: int | None = None,
+                  allowed_action_indices: list[int] | None = None) -> str:
     numbered_rules = [{"r": index, "title": rule["title"],
                        "observable_condition": rule["observable_condition"]}
                       for index, rule in enumerate(rules)]
     rule_json = json.dumps(numbered_rules, ensure_ascii=False)
+    proof_guidance = {
+        "cashier_leaves_during_service": (
+            "Only if directly visible: b shows the employee present in an ongoing cash receipt; "
+            "f shows actual departure from the workplace; a shows it vacated while that receipt "
+            "is still unfinished. Turning, reaching, standing or an already absent employee "
+            "does not establish this transition. "
+        ),
+        "prior_receipt_cash_exposed": (
+            "Only if directly visible: b supports completion of the first receipt; f shows the "
+            "next receipt starting; a shows that tracked prior cash still exposed. Current-client "
+            "cash alone or unclear transaction boundaries cannot establish this sequence. "
+        ),
+        "receipt_count_without_client": (
+            "Only if directly visible: b shows the cash handoff; f shows the client departing "
+            "before receipt completion; a shows counting that same receiving cash after departure. "
+            "An unseen client area or a later internal recheck cannot establish this sequence. "
+        ),
+    }.get(rules[0]["id"], "") if phase == "fine" and rules else ""
     phase_instructions = (
         f"This is candidate localization: return at most {MAX_WINDOW_EVENTS} events. "
-        'Return {"e":[{"r":0,"f":0}]}: r is the supplied rule index, f is the supplied frame index. '
+        "Each event contains r, the supplied rule index, and f, its supplied frame index. "
         "Do not narrate or explain candidates in this phase. "
         if phase == "coarse" else
         "This is detailed verification: confirm at most ONE event, or return an empty list. "
-        'Return {"e":[{"f":0,"d":"visible evidence"}]} for the sole supplied rule. '
+        "Each event MUST contain b (before), f (decisive action), a (after), c (cash/service "
+        "context) and d (description), for the sole supplied rule. Require b < f < a. "
+        "c MUST be one of b, f, a and directly show the cash receipt/service context "
+        "required by that rule, not merely documents, an occupied chair or cash alone. "
+        "The three frames together must directly support ALL parts of the observable condition. "
+        f"{proof_guidance}"
+        "Do not assume that any transaction, transition or violation occurred. "
+        f"The coarse candidate is frame f={candidate_frame_index}; it is a hypothesis, "
+        f"not evidence of a violation. Allowed decisive action indices: {allowed_action_indices}. "
+        "Use the wider context to verify this candidate; do not substitute a distant action. "
+        'If any required state, transition or cash/service context is missing, return {"e":[]}. '
         f"Description must be one short Russian sentence, at most 12 words and {DESCRIPTION_MAX_CHARS} characters. "
         "Describe only directly visible evidence. "
     )
@@ -406,6 +483,8 @@ class LocalQwenBackend:
         *,
         phase: str = "coarse",
         timeout_sec: float | None = None,
+        candidate_timecode_sec: float | None = None,
+        candidate_radius_sec: float | None = None,
     ) -> str:
         """Return pipeline event JSON expanded from a validated compact response."""
         reviewed_rules = _validated_rule_data(rules)
@@ -420,9 +499,21 @@ class LocalQwenBackend:
             raise ValueError("Frame timestamps must be finite and nonnegative.")
         if any(right < left for left, right in zip(timestamps, timestamps[1:])):
             raise ValueError("Frames must be ordered by timestamp.")
-        output_schema = _build_output_schema(reviewed_rules, timestamps, phase)
+        output_schema = _build_output_schema(
+            reviewed_rules, timestamps, phase, candidate_timecode_sec=candidate_timecode_sec,
+            candidate_radius_sec=candidate_radius_sec,
+        )
+        focus = (_fine_focus_indices(timestamps, candidate_timecode_sec, candidate_radius_sec)
+                 if phase == "fine" else None)
+        if phase == "fine" and not focus:
+            return '{"events":[]}'
+        candidate_index = (min(range(len(timestamps)), key=lambda i: abs(timestamps[i] - candidate_timecode_sec))
+                           if phase == "fine" else None)
         content: list[dict[str, str]] = [
-            {"type": "text", "text": _build_prompt(reviewed_rules, phase)}
+            {"type": "text", "text": _build_prompt(
+                reviewed_rules, phase, candidate_frame_index=candidate_index,
+                allowed_action_indices=focus,
+            )}
         ]
         for index, timestamp in enumerate(timestamps):
             content.extend([
@@ -507,7 +598,11 @@ class LocalQwenBackend:
                 )
                 if len(answers) != 1 or not isinstance(answers[0], str) or not answers[0].strip():
                     raise ModelUnavailableError("The local model returned no usable text.")
-                return _expand_wire_response(answers[0], reviewed_rules, timestamps, phase)
+                return _expand_wire_response(
+                    answers[0], reviewed_rules, timestamps, phase,
+                    candidate_timecode_sec=candidate_timecode_sec,
+                    candidate_radius_sec=candidate_radius_sec,
+                )
             except (ModelUnavailableError, InvalidModelOutputError):
                 raise
             except Exception as exc:

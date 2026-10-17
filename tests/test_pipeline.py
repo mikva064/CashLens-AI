@@ -51,17 +51,28 @@ def event(timestamp, *, rule_id="synthetic_event"):
     return {"rule_id": rule_id, "timecode_sec": timestamp, "description": "Synthetic visible event"}
 
 
+def proof_event(frames, action_sec=0.8):
+    action = min(frames, key=lambda frame: abs(frame.timestamp_sec - action_sec))
+    return {**event(action.timestamp_sec),
+            "evidence_timestamps_sec": [frames[0].timestamp_sec, action.timestamp_sec,
+                                        frames[-1].timestamp_sec],
+            "cash_context_timestamp_sec": frames[0].timestamp_sec}
+
+
 class RecordingBackend:
     def __init__(self, callback=None):
         self.calls = []
         self.callback = callback or (lambda phase, frames, rules: response())
 
-    def describe(self, frames, rules, *, phase="coarse", timeout_sec=None):
+    def describe(self, frames, rules, *, phase="coarse", timeout_sec=None,
+                 candidate_timecode_sec=None, candidate_radius_sec=None):
         self.calls.append({
             "phase": phase,
             "timestamps": [frame.timestamp_sec for frame in frames],
             "rules": rules,
             "timeout_sec": timeout_sec,
+            "candidate_timecode_sec": candidate_timecode_sec,
+            "candidate_radius_sec": candidate_radius_sec,
         })
         return self.callback(phase, frames, rules)
 
@@ -137,7 +148,7 @@ class PipelineTests(unittest.TestCase):
                 coarse_calls += 1
                 return response(event(0.6)) if coarse_calls == 1 else response()
             self.assertEqual(phase, "fine")
-            return response(event(0.73))
+            return response(proof_event(frames))
 
         backend = RecordingBackend(detect)
         output = self.root / "job"
@@ -153,7 +164,9 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual([round(ts, 6) for ts in fine_calls[0]["timestamps"]],
                          [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2])
         self.assertEqual([rule["id"] for rule in fine_calls[0]["rules"]], [self.rule.id])
-        self.assertEqual([round(frame.timestamp_sec, 6) for frame in violation.evidence_frames], [0.2, 0.8, 1.2])
+        self.assertEqual([round(frame.timestamp_sec, 6) for frame in violation.evidence_frames], [0.0, 0.8, 1.2])
+        self.assertEqual(fine_calls[0]["candidate_timecode_sec"], 0.6)
+        self.assertEqual(fine_calls[0]["candidate_radius_sec"], self.config.refine_radius_sec)
         for frame in violation.evidence_frames:
             self.assertEqual(frame.image_path.parent, output.resolve())
             self.assertTrue(frame.image_path.is_file())
@@ -225,9 +238,9 @@ class PipelineTests(unittest.TestCase):
             nonlocal coarse_calls
             if phase == "coarse":
                 coarse_calls += 1
-                return (response(event(0.2), event(0.6), event(1.0))
+                return (response(event(0.6), event(0.8), event(1.0))
                         if coarse_calls == 1 else response())
-            return response(event(0.73))
+            return response(proof_event(frames))
 
         # Keep the three coarse anchors separate so only context deduplication
         # can prevent repeated fine inference on their identical rule/window.

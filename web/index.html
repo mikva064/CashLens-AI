@@ -3,71 +3,153 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>CashLens AI</title>
+  <title>CashLens — проверка кассы по видео</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <header>
-    <h1>CashLens AI</h1>
-    <p class="muted">Выявление признаков нарушений кассовой дисциплины по видео</p>
+  <header class="top">
+    <div class="top-inner">
+      <a class="wordmark" href="/">CashLens</a>
+      <span class="top-sub">Проверка кассовых операций по видео</span>
+      <span id="mode" class="mode" hidden></span>
+    </div>
   </header>
 
   <main>
-    <section class="card model-card" aria-labelledby="model-heading">
-      <h2 id="model-heading">Локальный анализ</h2>
-      <p id="model-status" class="model-status loading" role="status">Проверяем готовность модели…</p>
-      <p id="model-name" class="muted"></p>
-      <p id="performance" class="muted" hidden></p>
-      <p id="performance-note" class="muted" hidden></p>
-      <p id="model-privacy" class="muted">Видео и кадры обрабатываются на этом компьютере. Облачные AI-сервисы не используются.</p>
-      <details id="coverage">
-        <summary id="coverage-summary">Подключённые правила и ограничения</summary>
-        <p id="limitations" class="muted">Сервис ищет видимые признаки по подключённым правилам. Результат требует проверки специалистом и не является окончательным юридическим заключением.</p>
-        <div id="rules"></div>
-      </details>
-    </section>
-    <section class="card">
+    <section class="intake" aria-labelledby="intake-title">
+      <h1 id="intake-title">Загрузите запись с камеры кассы</h1>
+      <p class="lead">
+        Сервис найдёт моменты, похожие на нарушение кассовой дисциплины, и покажет
+        таймкод, кадры и норму, на которую стоит опереться при проверке.
+      </p>
+
+      <div class="model-panel">
+        <p id="model-status" class="model-status loading" role="status">Проверяем готовность модели…</p>
+        <p id="model-name" class="muted"></p>
+        <p id="performance" class="muted" hidden></p>
+        <p id="performance-note" class="muted" hidden></p>
+      </div>
+
       <form id="upload">
         <label class="drop" id="drop">
-          <input type="file" id="file" accept=".mov,.mp4,video/*" hidden disabled>
-          <span id="drop-text">Перетащите .mov сюда или нажмите, чтобы выбрать</span>
+          <input type="file" id="file" accept=".mov,.mp4,video/*" disabled>
+          <span class="drop-title" id="drop-title">Перетащите файл .mov сюда</span>
+          <span class="drop-hint" id="drop-hint">или нажмите, чтобы выбрать на компьютере</span>
         </label>
-        <button type="submit" id="submit" disabled>Анализировать</button>
+        <button type="submit" id="submit" class="primary" disabled>Проверить запись</button>
       </form>
       <progress id="progress" max="100" value="0" hidden></progress>
-      <p id="status" class="muted" role="status" aria-live="polite"></p>
+
+      <ol class="steps" id="steps" hidden>
+        <li data-step="upload">Загрузка</li>
+        <li data-step="queued">Очередь</li>
+        <li data-step="processing">Анализ</li>
+        <li data-step="done">Готово</li>
+      </ol>
+      <p id="status" class="status" role="status" aria-live="polite"></p>
     </section>
 
-    <section id="result" hidden>
+    <section id="result" class="result" hidden aria-label="Результат проверки">
+      <div class="print-head">
+        <p class="print-title">Отчёт о проверке видеозаписи кассы</p>
+        <dl>
+          <dt>Файл</dt><dd id="r-file"></dd>
+          <dt>Проверено</dt><dd id="r-date"></dd>
+          <dt>Номер проверки</dt><dd id="r-id"></dd>
+          <dt>SHA-256 видео</dt><dd id="r-input-sha256" class="report-hash"></dd>
+          <dt>SHA-256 JSON</dt><dd id="r-result-sha256" class="report-hash"></dd>
+        </dl>
+      </div>
       <div id="demo" class="demo" hidden>
-        Демо-режим: модель не подключена, результат сгенерирован заглушкой и не отражает содержимое видео.
+        Демо-режим: модель не подключена. Результат сгенерирован заглушкой и не отражает содержимое видео.
       </div>
-      <div id="verdict" class="verdict"></div>
+
+      <div id="verdict" class="verdict">
+        <p class="verdict-title" id="verdict-title"></p>
+        <p class="verdict-meta" id="verdict-meta"></p>
+      </div>
       <p id="result-model" class="muted"></p>
-      <p class="muted">Проверьте последовательность действий и применимость указанного пункта. Отсутствие найденных событий не гарантирует соблюдения всех требований законодательства РК.</p>
-      <div class="card">
-        <video id="player" controls muted playsinline></video>
-        <div id="timeline" class="timeline"></div>
+
+      <div class="layout">
+        <aside class="viewer">
+          <video id="player" controls muted playsinline preload="metadata"></video>
+          <div class="track" id="track" aria-label="Шкала записи с отметками событий"></div>
+          <div class="track-scale"><span>00:00</span><span id="track-end"></span></div>
+          <div class="viewer-actions">
+            <button type="button" id="print" class="ghost">Распечатать отчёт</button>
+            <a id="download" class="quiet-link" download="cashlens-result.json">Скачать JSON</a>
+          </div>
+          <p id="download-note" class="muted download-note"></p>
+        </aside>
+
+        <div class="findings">
+          <div id="events"></div>
+          <div class="print-sign">
+            <p>Решение проверяющего: ______________________________</p>
+            <p>Проверяющий: ____________________ (ФИО, подпись)    Дата: ____________</p>
+            <p class="print-note">Отчёт сформирован CashLens автоматически и является подсказкой для
+              проверяющего, а не заключением. Лица на записи не распознавались.</p>
+          </div>
+          <div id="clean" class="clean" hidden>
+            <p>В записи не найдено действий, которые подпадают под проверяемые правила.</p>
+            <p class="muted">Ниже — что именно сервис искал в этой записи.</p>
+          </div>
+        </div>
       </div>
-      <div id="events"></div>
-      <p><a id="download" class="muted" download="result.json">Скачать JSON</a></p>
+    </section>
+
+    <section class="checks" aria-labelledby="checks-title">
+      <details id="checks">
+        <summary id="checks-title">Что проверяет сервис</summary>
+        <p id="limitations" class="muted">Сервис ищет видимые признаки по подключённым правилам. Результат требует проверки специалистом и не является окончательным юридическим заключением.</p>
+        <ul id="rules" class="rules"></ul>
+        <div class="feedback-stats" aria-labelledby="stats-title">
+          <h3 id="stats-title">Отметки проверяющих</h3>
+          <p id="stats-status" class="muted" role="status">Загружаем отметки…</p>
+          <ul id="stats-rules" class="rules"></ul>
+          <p class="muted">Это оценки найденных событий проверяющими, а не измеренная точность модели. Проверки без событий здесь не учитываются.</p>
+        </div>
+      </details>
     </section>
   </main>
 
+  <footer class="foot">
+    <p>
+      Результат — подсказка для проверяющего, а не заключение. Лица не распознаются,
+      видео и кадры не передаются во внешние сервисы.
+    </p>
+  </footer>
+
   <template id="event-tpl">
-    <article class="card event">
-      <div class="event-head">
-        <button class="timecode" type="button"></button>
-        <h3 class="type"></h3>
-      </div>
-      <p class="description"></p>
+    <article class="event">
+      <header class="event-head">
+        <button class="timecode" type="button" title="Перейти к моменту в видео"></button>
+        <h2 class="event-type"></h2>
+      </header>
+      <p class="event-desc"></p>
       <div class="frames"></div>
-      <div class="rule">
-        <strong>Источник:</strong> <span class="doc"></span>, <span class="section"></span><br>
-        <a class="source" target="_blank" rel="noopener"></a>
+      <div class="event-clip" hidden>
+        <p class="event-clip-title">Мини-клип с контекстом события</p>
+        <video class="clip-player" controls muted playsinline preload="metadata"></video>
+      </div>
+      <div class="basis">
+        <p class="basis-label">Основание</p>
+        <p class="basis-doc"></p>
+        <a class="basis-link" target="_blank" rel="noopener">Открыть текст нормы</a>
+      </div>
+      <div class="review" role="group" aria-label="Оценка проверяющего">
+        <button type="button" class="ghost" data-decision="confirmed">Подтверждаю нарушение</button>
+        <button type="button" class="ghost" data-decision="rejected">Ложное срабатывание</button>
+        <span class="review-state" aria-live="polite"></span>
       </div>
     </article>
   </template>
+
+  <dialog id="zoom" class="zoom">
+    <form method="dialog"><button class="zoom-close" aria-label="Закрыть">Закрыть</button></form>
+    <img id="zoom-img" alt="">
+    <p id="zoom-cap"></p>
+  </dialog>
 
   <script src="/static/app.js"></script>
 </body>

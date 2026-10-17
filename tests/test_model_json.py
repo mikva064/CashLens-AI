@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from cashlens_ai.errors import InvalidModelOutputError
@@ -26,3 +27,40 @@ class LocalModelFormattingTests(unittest.TestCase):
                       '{"rule_id":"test_rule","timecode_sec":7,"description":"test"}'):
             with self.assertRaises(InvalidModelOutputError):
                 self.parse('{"events":[' + event + ']}"')
+
+    def test_fine_proof_requires_exact_ordered_frames_and_candidate_focus(self):
+        valid = {"rule_id": "test_rule", "timecode_sec": 1.0, "description": "Test evidence",
+                 "evidence_timestamps_sec": [0.0, 1.0, 2.0], "cash_context_timestamp_sec": 0.0}
+
+        def parse_fine(event):
+            return parse_model_response(
+                json.dumps({"events": [event]}), allowed_ids={"test_rule"}, first_sec=0, last_sec=2,
+                require_proof=True, frame_timestamps=[0.0, 0.5, 1.0, 1.5, 2.0],
+                candidate_timecode_sec=1.0, candidate_radius_sec=0.25,
+            )
+
+        self.assertEqual(parse_fine(valid)[0].evidence_timestamps_sec, [0.0, 1.0, 2.0])
+        missing = {key: value for key, value in valid.items() if key != "evidence_timestamps_sec"}
+        for event in (missing,
+                      {**valid, "evidence_timestamps_sec": [0.0, 1.0, 1.0]},
+                      {**valid, "evidence_timestamps_sec": [2.0, 1.0, 0.0]},
+                      {**valid, "evidence_timestamps_sec": [0.1, 1.0, 2.0]},
+                      {**valid, "evidence_timestamps_sec": [False, 1.0, 2.0]},
+                      {**valid, "cash_context_timestamp_sec": 0.5},
+                      {**valid, "cash_context_timestamp_sec": False},
+                      {**valid, "timecode_sec": 1.5},
+                      {**valid, "timecode_sec": 1.5,
+                       "evidence_timestamps_sec": [0.0, 1.5, 2.0]}):
+            with self.subTest(event=event), self.assertRaises(InvalidModelOutputError):
+                parse_fine(event)
+        self.assertEqual(parse_model_response(
+            '{"events":[]}', allowed_ids={"test_rule"}, first_sec=0, last_sec=2,
+            require_proof=True, frame_timestamps=[0.0, 1.0, 2.0],
+            candidate_timecode_sec=1, candidate_radius_sec=0.25,
+        ), [])
+        with self.assertRaises(InvalidModelOutputError):
+            parse_model_response(
+                json.dumps({"events": [valid, valid]}), allowed_ids={"test_rule"}, first_sec=0, last_sec=2,
+                require_proof=True, frame_timestamps=[0.0, 1.0, 2.0],
+                candidate_timecode_sec=1, candidate_radius_sec=0.25,
+            )

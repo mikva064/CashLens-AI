@@ -227,13 +227,15 @@ class BackendTests(unittest.TestCase):
         torch, transformers, *_ = self.fake_dependencies()
         with patch.dict(sys.modules, self.dependency_modules(torch, transformers)), patch.dict(os.environ):
             self.backend.describe(self.frames, RULES)
-            later_frames = [SimpleNamespace(timestamp_sec=20.5, image=object())]
-            self.backend.describe(later_frames, RULES, phase="fine")
+            later_frames = [SimpleNamespace(timestamp_sec=value, image=object())
+                            for value in (20.0, 20.5, 21.0)]
+            self.backend.describe(later_frames, RULES, phase="fine",
+                                  candidate_timecode_sec=20.5, candidate_radius_sec=0.25)
         transformers._lmfe_integration.build_token_enforcer_tokenizer_data.assert_called_once()
         self.assertEqual(transformers._lmfe.JsonSchemaParser.call_count, 2)
         schema = transformers._lmfe.JsonSchemaParser.call_args.args[0]
         times = schema["properties"]["e"]["items"]["properties"]["f"]
-        self.assertEqual(times["enum"], [0])
+        self.assertEqual(times["enum"], [1])
         self.assertEqual(schema["properties"]["e"]["maxItems"], 1)
         description = schema["properties"]["e"]["items"]["properties"]["d"]
         self.assertEqual(description["maxLength"], 96)
@@ -261,13 +263,21 @@ class BackendTests(unittest.TestCase):
     def test_prompts_use_bounded_phase_specific_descriptions(self):
         coarse = _build_prompt(RULES, "coarse")
         fine = _build_prompt(RULES, "fine")
-        self.assertIn('{"e":[{"r":0,"f":0}]}', coarse)
+        self.assertNotIn('{"e":[{"r":0,"f":0}]}', coarse)
         self.assertNotIn(COARSE_DESCRIPTION, coarse)
         self.assertIn("Do not narrate or explain candidates", coarse)
         self.assertIn("at most ONE event", fine)
         self.assertIn("at most 12 words and 96 characters", fine)
         self.assertNotIn(COARSE_DESCRIPTION, fine)
-        self.assertIn('{"e":[{"f":0,"d":"visible evidence"}]}', fine)
+        self.assertIn("b (before), f (decisive action), a (after), c (cash/service", fine)
+        self.assertIn("Require b < f < a", fine)
+
+    def test_fine_without_ordered_proof_context_abstains_before_gpu_loading(self):
+        with patch.object(self.backend, "_load_model") as load:
+            result = self.backend.describe(self.frames, RULES, phase="fine",
+                                           candidate_timecode_sec=10.25, candidate_radius_sec=2)
+        self.assertEqual(result, '{"events":[]}')
+        load.assert_not_called()
 
     def test_memory_limit_is_applied_after_loaded_weights_and_cache_release(self):
         torch, transformers, model, *_ = self.fake_dependencies()
@@ -366,14 +376,26 @@ class CompactWireTests(unittest.TestCase):
     def test_fine_uses_sole_rule_and_expands_existing_pipeline_schema(self):
         from cashlens_ai.pipeline import parse_model_response
 
-        timestamps = [120.123456789, 121.987654321]
-        text = _expand_wire_response('{"e":[{"f":1,"d":"Тестовое действие."}]}',
-                                     RULES, timestamps, "fine")
+        timestamps = [120.123456789, 121.987654321, 125.123456789]
+        text = _expand_wire_response('{"e":[{"b":0,"f":1,"a":2,"c":0,"d":"Тестовое действие."}]}',
+                                     RULES, timestamps, "fine", candidate_timecode_sec=timestamps[1],
+                                     candidate_radius_sec=0.5)
         result = parse_model_response(text, allowed_ids={"demo_rule"},
-                                      first_sec=timestamps[0], last_sec=timestamps[-1])
+                                      first_sec=timestamps[0], last_sec=timestamps[-1],
+                                      require_proof=True, frame_timestamps=timestamps,
+                                      candidate_timecode_sec=timestamps[1], candidate_radius_sec=0.5)
         self.assertEqual(result[0].rule_id, "demo_rule")
         self.assertEqual(result[0].timecode_sec, timestamps[1])
         self.assertEqual(result[0].description, "Тестовое действие.")
+        self.assertEqual(result[0].evidence_timestamps_sec, timestamps)
+        self.assertEqual(result[0].cash_context_timestamp_sec, timestamps[0])
+
+    def test_rule_permutation_preserves_the_selected_semantic_rule(self):
+        other = {**RULES[0], "id": "another_reviewed_rule"}
+        for rules, index in ((RULES + [other], 1), ([other] + RULES, 0)):
+            result = json.loads(_expand_wire_response(
+                json.dumps({"e": [{"r": index, "f": 0}]}), rules, [12.0]))
+            self.assertEqual(result["events"][0]["rule_id"], other["id"])
 
     def test_invalid_or_ambiguous_indices_never_become_clean_events(self):
         for event in ({"r": True, "f": 0}, {"r": 0, "f": False}, {"r": 0.0, "f": 0},
@@ -391,15 +413,33 @@ class CompactWireTests(unittest.TestCase):
                 _expand_wire_response(text, RULES, [12.0])
 
     def test_fine_description_and_cardinality_are_validated(self):
-        for event in ({"f": 0, "d": ""}, {"f": 0, "d": " "}, {"f": 0, "d": False},
-                      {"f": 0, "d": "x" * (DESCRIPTION_MAX_CHARS + 1)},
-                      {"f": True, "d": "x"}, {"r": 0, "f": 0, "d": "x"}):
+        valid = {"b": 0, "f": 1, "a": 2, "c": 0, "d": "x"}
+        for event in ({**valid, "d": ""}, {**valid, "d": " "}, {**valid, "d": False},
+                      {**valid, "d": "x" * (DESCRIPTION_MAX_CHARS + 1)},
+                      {**valid, "f": True}, {**valid, "r": 0}):
             with self.subTest(event=event), self.assertRaises(InvalidModelOutputError):
-                _expand_wire_response(json.dumps({"e": [event]}), RULES, [12.0], "fine")
+                _expand_wire_response(json.dumps({"e": [event]}), RULES, [12.0, 13.0, 14.0], "fine",
+                                      candidate_timecode_sec=13.0, candidate_radius_sec=0.5)
         for phase, event, count in (("coarse", {"r": 0, "f": 0}, 4),
-                                    ("fine", {"f": 0, "d": "x"}, 2)):
+                                    ("fine", valid, 2)):
             with self.subTest(phase=phase), self.assertRaises(InvalidModelOutputError):
-                _expand_wire_response(json.dumps({"e": [event] * count}), RULES, [12.0], phase)
+                _expand_wire_response(json.dumps({"e": [event] * count}), RULES, [12.0, 13.0, 14.0], phase,
+                                      candidate_timecode_sec=13.0, candidate_radius_sec=0.5)
+
+    def test_fine_rejects_missing_reversed_unrelated_or_unfocused_proof(self):
+        valid = {"b": 0, "f": 1, "a": 2, "c": 0, "d": "x"}
+        invalid = [{key: value for key, value in valid.items() if key != missing}
+                   for missing in ("b", "a", "c")]
+        invalid += [{**valid, "b": 1}, {**valid, "a": 0}, {**valid, "c": 3},
+                    {**valid, "b": False}, {**valid, "a": 99},
+                    {**valid, "f": 2, "a": 3}]
+        for event in invalid:
+            with self.subTest(event=event), self.assertRaises(InvalidModelOutputError):
+                _expand_wire_response(json.dumps({"e": [event]}), RULES, [12., 13., 14., 15.], "fine",
+                                      candidate_timecode_sec=13., candidate_radius_sec=0.25)
+        with self.assertRaises(InvalidModelOutputError):
+            _expand_wire_response(json.dumps({"e": [valid]}), RULES, [12., 13., 13.], "fine",
+                                  candidate_timecode_sec=13., candidate_radius_sec=0.25)
 
     def test_fine_requires_one_trusted_rule(self):
         with self.assertRaises(ValueError):
@@ -469,8 +509,10 @@ class ConstrainedSchemaTests(unittest.TestCase):
         self.config = CharacterLevelParserConfig(max_consecutive_whitespaces=1,
                                                 force_json_field_order=True)
         self.config.alphabet += "".join(chr(code) for code in range(0x0400, 0x0500))
-        self.schemas = {phase: _build_output_schema(RULES, [10.25, 11.5], phase)
-                        for phase in ("coarse", "fine")}
+        self.schemas = {"coarse": _build_output_schema(RULES, [10.25, 11.5]),
+                        "fine": _build_output_schema(RULES, [10.25, 11.5, 13.0], "fine",
+                                                     candidate_timecode_sec=11.5,
+                                                     candidate_radius_sec=0.25)}
 
     def accepts(self, text, phase="coarse"):
         parser = self.parser_type(self.schemas[phase], config=self.config)
@@ -498,10 +540,10 @@ class ConstrainedSchemaTests(unittest.TestCase):
                 self.assertFalse(self.accepts(json.dumps({"e": [event]}, ensure_ascii=False)))
 
     def test_fine_accepts_one_short_description_and_blocks_long_or_multiple_events(self):
-        event = {"f": 0, "d": "Тестовое видимое действие."}
+        event = {"b": 0, "f": 1, "a": 2, "c": 0, "d": "Тестовое видимое действие."}
         self.assertTrue(self.accepts(json.dumps({"e": [event]}, ensure_ascii=False), "fine"))
         self.assertFalse(self.accepts(json.dumps({"e": [event, event]}, ensure_ascii=False), "fine"))
-        event = {"f": 0, "d": "x" * (DESCRIPTION_MAX_CHARS + 1)}
+        event = {**event, "d": "x" * (DESCRIPTION_MAX_CHARS + 1)}
         self.assertFalse(self.accepts(json.dumps({"e": [event]}, ensure_ascii=False), "fine"))
 
     def test_coarse_description_cannot_be_generated(self):

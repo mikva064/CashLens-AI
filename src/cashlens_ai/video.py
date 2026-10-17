@@ -1,7 +1,7 @@
 """Streaming local video decoding with timestamps from the source video.
 
-Timestamps are seconds relative to the video stream start. Container rotation
-metadata is not applied; coordinates and sizes describe the encoded image.
+Timestamps are seconds relative to the video stream start. Container display
+rotation is applied before resizing; dimensions describe the displayed image.
 """
 
 from __future__ import annotations
@@ -118,8 +118,25 @@ def _decode_from(path: str | Path, start: float):
         yield from _decode_frames(container, stream)
 
 
-def _sample(frame, timestamp: float, max_edge: int | None) -> SampledFrame:
+def _display_image(frame) -> Image.Image:
+    """PyAV exposes the container DISPLAYMATRIX on decoded source frames.
+
+    Rotation is counterclockwise, like Pillow, and is never applied twice by
+    PyAV's to_image(). Right-angle rotations preserve the original pixels.
+    """
     image = frame.to_image().convert("RGB")
+    angle = frame.rotation % 360
+    transpose = {90: Image.Transpose.ROTATE_90, 180: Image.Transpose.ROTATE_180,
+                 270: Image.Transpose.ROTATE_270}
+    if angle in transpose:
+        image = image.transpose(transpose[angle])
+    elif angle:
+        image = image.rotate(angle, resample=Image.Resampling.BICUBIC, expand=True)
+    return image
+
+
+def _sample(frame, timestamp: float, max_edge: int | None) -> SampledFrame:
+    image = _display_image(frame)
     if max_edge is not None and max(image.size) > max_edge:
         scale = max_edge / max(image.size)
         size = (max(1, round(image.width * scale)), max(1, round(image.height * scale)))
@@ -154,11 +171,12 @@ def probe_video(path: str | Path) -> VideoInfo:
                 tail = 1.0 / float(stream.average_rate)
             duration = max(0.0, last_time + tail)
 
+        display_size = _display_image(first[0]).size
         return VideoInfo(
             path=source,
             duration_sec=duration,
-            width=first[0].width,
-            height=first[0].height,
+            width=display_size[0],
+            height=display_size[1],
             codec=stream.codec_context.name or "unknown",
             has_audio=bool(container.streams.audio),
         )
