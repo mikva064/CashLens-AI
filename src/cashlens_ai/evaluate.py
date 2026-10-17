@@ -85,7 +85,10 @@ def _validated_result(prediction: dict) -> tuple[AnalysisResult | None, str | No
         # JSON-mode strict validation accepts the contract's serialized Path
         # strings while rejecting coerced string timestamps and nonfinite data.
         serialized = json.dumps(prediction["result"], allow_nan=False)
-        return AnalysisResult.model_validate_json(serialized, strict=True), None
+        result = AnalysisResult.model_validate_json(serialized, strict=True)
+        if result.verdict == "requires_review":
+            return None, "requires_review: visual observations are not a qualified binary prediction"
+        return result, None
     except (TypeError, ValueError, ValidationError):
         return None, "Completed prediction failed AnalysisResult validation"
 

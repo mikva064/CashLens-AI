@@ -14,6 +14,7 @@
 !web/**
 !config/
 !config/rules.json
+!config/observations.json
 
 # Keep these exclusions even if more source directories are allowed above.
 local/

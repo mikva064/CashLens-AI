@@ -10,6 +10,7 @@ from cashlens_ai.contracts import AnalysisResult
 from cashlens_ai.errors import AnalysisTimeoutError
 from cashlens_ai.pipeline import AnalyzerConfig, VideoAnalyzer
 from cashlens_ai.rules import load_rules
+from cashlens_ai.observations import PIPELINE_REVISION, catalog_hash, load_observations
 
 # Запас между бюджетом модели и лимитом задачи: кадры в base64, ответ, сеть.
 SAFETY_SEC = 20.0
@@ -27,9 +28,11 @@ class QwenAnalyzer:
     def __init__(self) -> None:
         self.model_dir = self._path("CASHLENS_MODEL_DIR", "local/models/qwen3-vl-2b")
         self.rules_path = self._path("CASHLENS_RULES", "config/rules.json")
+        self.observations_path = self._path("CASHLENS_OBSERVATIONS", "config/observations.json")
         self._analyzer: VideoAnalyzer | None = None
         self._backend: LocalQwenBackend | None = None
         self._rules = []
+        self._observations = []
         self.profile = os.getenv("CASHLENS_PERFORMANCE_PROFILE", "balanced").strip().lower()
         self._performance = {}
 
@@ -43,6 +46,12 @@ class QwenAnalyzer:
             "model_name": os.getenv("CASHLENS_MODEL_NAME", "Qwen3-VL-2B-Instruct"),
             "rule_count": len(self._rules),
             "rules": [rule.model_dump(mode="json", exclude={"verified"}) for rule in self._rules],
+            "observation_type_count": len(self._observations),
+            "observation_types": [{"id": item.id, "title": item.title,
+                                   "observable_condition": item.observable_condition}
+                                  for item in self._observations],
+            "pipeline_revision": PIPELINE_REVISION,
+            "catalog_hash": catalog_hash(self._rules, self._observations),
             "performance": dict(self._performance),
             "limitations": (
                 "Модель ищет видимые признаки только перечисленных событий. "
@@ -58,6 +67,7 @@ class QwenAnalyzer:
         defaults = PROFILE_DEFAULTS[self.profile]
         # Правила проверяются до загрузки весов: пустой реестр блокирует анализ.
         self._rules = load_rules(self.rules_path)
+        self._observations = load_observations(self.observations_path)
         config = AnalyzerConfig(
             sample_fps=float(os.getenv("CASHLENS_SAMPLE_FPS", "1")),
             window_sec=float(os.getenv("CASHLENS_WINDOW_SEC", "24")),
@@ -79,7 +89,8 @@ class QwenAnalyzer:
         )
         try:
             self._backend.load()
-            self._analyzer = VideoAnalyzer(self._backend, self._rules, config=config)
+            self._analyzer = VideoAnalyzer(self._backend, self._rules,
+                                           observations=self._observations, config=config)
             self._performance = {
                 "profile": self.profile, "sample_fps": config.sample_fps,
                 "window_sec": config.window_sec, "overlap_sec": config.overlap_sec,

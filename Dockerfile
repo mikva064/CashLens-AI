@@ -11,6 +11,7 @@ ENV PYTHONUNBUFFERED=1 \
     CASHLENS_ANALYZER=model \
     CASHLENS_MODEL_DIR=/models/qwen3-vl-2b \
     CASHLENS_RULES=/app/config/rules.json \
+    CASHLENS_OBSERVATIONS=/app/config/observations.json \
     CASHLENS_DATA_DIR=/data
 
 RUN apt-get update \
@@ -23,6 +24,7 @@ COPY src ./src
 COPY analyzer ./analyzer
 COPY app ./app
 COPY config/rules.json ./config/rules.json
+COPY config/observations.json ./config/observations.json
 COPY web ./web
 
 RUN python -m pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu126 \

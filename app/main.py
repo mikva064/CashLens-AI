@@ -1,4 +1,5 @@
 import hashlib
+import copy
 import json
 import logging
 import os
@@ -109,6 +110,9 @@ def _done_view(job: dict, for_api: bool) -> dict:
     stored = job["result"]
     result = AnalysisResult.model_validate(stored["analysis"])
     if for_api:
+        if result.verdict == "requires_review":
+            return {"job_id": job["id"], "status": "failed", "failure_code": "requires_review",
+                    "error": "Обнаружены эпизоды, требующие проверки. Нормативный вердикт не сформирован."}
         # Точная схема жюри (ТЗ, раздел 10): адаптер AI-модуля кодирует кадры в base64
         # и дописывает нормативный источник в description.
         view = to_api_payload(result, job_id=job["id"], evidence_root=job_dir / "ai")
@@ -173,7 +177,11 @@ def get_analysis(job_id: str):
     job = _load(job_id)
     if job["status"] != "done":
         raise HTTPException(status_code=409, detail="Задача ещё не завершена")
-    analysis = job["result"]["analysis"]
+    analysis = copy.deepcopy(job["result"]["analysis"])
+    if analysis["verdict"] == "requires_review":
+        raise HTTPException(status_code=409, detail="Требуется проверка эпизодов; нормативного вердикта нет")
+    # The public/internal API exposes qualified events only; observations are web-only.
+    analysis.pop("observations", None)
     for v in analysis["violations"]:
         for f in v["evidence_frames"]:
             f["image_path"] = Path(f["image_path"]).name  # пути сервера наружу не отдаём
@@ -189,6 +197,9 @@ def health():
             "model_name": analyzer["model_name"], "rule_count": analyzer["rule_count"],
             "rules": analyzer["rules"], "limitations": analyzer["limitations"],
             "performance": analyzer["performance"],
+            "observation_type_count": analyzer["observation_type_count"],
+            "observation_types": analyzer["observation_types"],
+            "pipeline_revision": analyzer["pipeline_revision"], "catalog_hash": analyzer["catalog_hash"],
             "max_outstanding_jobs": MAX_OUTSTANDING_JOBS,
             "web_upload_enabled": WEB_UPLOAD_ENABLED,
             "max_upload_mb": MAX_UPLOAD_MB, "job_timeout_sec": JOB_TIMEOUT_SEC}

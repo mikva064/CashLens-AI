@@ -16,6 +16,8 @@ def to_api_payload(result: AnalysisResult, *, job_id: str, evidence_root: str | 
     included in description because the published API has no separate source
     field. The service should show the structured source in its UI as well.
     """
+    if result.verdict == "requires_review":
+        raise CashLensError("Review observations cannot be projected as a qualified binary verdict")
     root = Path(evidence_root).resolve(strict=True)
     violations = []
     for event in result.violations:

@@ -114,13 +114,14 @@ function setSourceLink(link, source) {
 }
 
 function renderCoverage(health) {
-  const signature = JSON.stringify([health.rules, health.limitations]);
+  const signature = JSON.stringify([health.rules, health.observation_types, health.limitations]);
   if (signature === coverageSignature) return;
   coverageSignature = signature;
   const rules = Array.isArray(health.rules) ? health.rules : [];
+  const observationTypes = Array.isArray(health.observation_types) ? health.observation_types : [];
   ruleTitles = new Map(rules.map((rule) => [rule.id, rule.title || rule.id]));
   renderStats();
-  $("checks-title").textContent = `Что проверяет сервис · подключено правил: ${rules.length}`;
+  $("checks-title").textContent = `Что проверяет сервис · правил: ${rules.length} · типов эпизодов: ${observationTypes.length}`;
   $("limitations").textContent = typeof health.limitations === "string" && health.limitations
     ? health.limitations
     : "Сервис ищет видимые признаки по подключённым правилам. Результат требует проверки специалистом и не является окончательным юридическим заключением.";
@@ -144,6 +145,24 @@ function renderCoverage(health) {
     setSourceLink(link, rule.source);
     item.append(title, condition, source, link);
     list.append(item);
+  });
+  const observations = $("observation-types");
+  observations.replaceChildren();
+  if (!observationTypes.length) {
+    const empty = document.createElement("li");
+    empty.className = "muted";
+    empty.textContent = "Дополнительные типы наблюдаемых эпизодов пока не подключены.";
+    observations.append(empty);
+  }
+  observationTypes.forEach((entry) => {
+    const item = document.createElement("li");
+    const title = document.createElement("strong");
+    const condition = document.createElement("span");
+    title.textContent = typeof entry === "string" ? entry : entry.title || entry.id;
+    condition.textContent = typeof entry === "string" ? "Требует оценки человеком."
+      : entry.observable_condition || entry.description || "Требует оценки человеком.";
+    item.append(title, condition);
+    observations.append(item);
   });
 }
 
@@ -339,7 +358,8 @@ async function poll(jobId, started, run, failures) {
     if (run !== activeRun) return;
     const secs = Math.round((Date.now() - started) / 1000);
     if (job.status === "done") {
-      if (!Array.isArray(job.violations) || !["violation", "no_violation"].includes(job.verdict)) {
+      if (!Array.isArray(job.violations) || !["violation", "no_violation", "requires_review"].includes(job.verdict)
+          || (job.observations !== undefined && !Array.isArray(job.observations))) {
         throw new Error("Сервер вернул неполный результат анализа");
       }
       render(job);
@@ -428,8 +448,14 @@ function updateDownload(job) {
 }
 
 function render(job) {
-  const items = job.violations;
-  const found = items.length > 0;
+  const qualified = job.violations;
+  const observations = Array.isArray(job.observations) ? job.observations : [];
+  const found = qualified.length > 0;
+  const reviewRequired = job.review_required === true || observations.length > 0 || job.verdict === "requires_review";
+  const items = [
+    ...qualified.map((event, index) => ({ event, index, observation: false })),
+    ...observations.map((event) => ({ event, index: null, observation: true })),
+  ].sort((left, right) => left.event.timecode_sec - right.event.timecode_sec);
   const runAtRender = activeRun;
   $("demo").hidden = job.analyzer !== "mock";
   $("result-model").textContent = job.analyzer === "mock"
@@ -437,12 +463,15 @@ function render(job) {
     : `Видео обработано локальной моделью${$("model-name").textContent ? ` · ${$("model-name").textContent}` : ""}`;
 
   const verdict = $("verdict");
-  verdict.classList.toggle("clear", !found);
-  $("verdict-title").textContent = found
-    ? "Обнаружены признаки возможных нарушений"
+  verdict.classList.toggle("clear", !found && !reviewRequired);
+  verdict.classList.toggle("review-required", !found && reviewRequired);
+  $("verdict-title").textContent = found ? "Обнаружены признаки возможных нарушений"
+    : reviewRequired ? "Требуется проверка наблюдаемых эпизодов"
     : "Признаки нарушений по подключённым правилам не обнаружены";
-  const count = found ? `${items.length} ${plural(items.length, "событие", "события", "событий")}. ` : "";
-  $("verdict-meta").textContent = `${count}Проверка заняла ${Math.round(Number(job.processing_time_sec) || 0)} с.`;
+  const counts = [];
+  if (found) counts.push(`По нормативным правилам: ${qualified.length}`);
+  if (observations.length) counts.push(`Эпизодов для проверки: ${observations.length}`);
+  $("verdict-meta").textContent = `${counts.length ? `${counts.join(" · ")}. ` : ""}Проверка заняла ${Math.round(Number(job.processing_time_sec) || 0)} с.`;
   verdict.classList.remove("reveal");
   void verdict.offsetWidth;
   verdict.classList.add("reveal");
@@ -465,20 +494,27 @@ function render(job) {
   player.ontimeupdate = () => {
     head.style.left = `${Math.min(100, Math.max(0, player.currentTime / duration * 100))}%`;
   };
-  items.forEach((ev) => {
+  items.forEach(({ event: ev, observation }) => {
     const mark = document.createElement("button");
     mark.type = "button";
+    if (observation) mark.className = "observation";
     mark.style.left = `${Math.min(100, Math.max(0, (Number(ev.timecode_sec) || 0) / duration * 100))}%`;
-    mark.title = `${fmt(ev.timecode_sec)} ${ev.type}`;
-    mark.setAttribute("aria-label", `Перейти к ${fmt(ev.timecode_sec)}: ${ev.type}`);
+    mark.title = `${fmt(ev.timecode_sec)} ${ev.type}${observation ? " — требует проверки" : ""}`;
+    mark.setAttribute("aria-label", `Перейти к ${fmt(ev.timecode_sec)}: ${ev.type}${observation ? ", требует проверки" : ""}`);
     mark.onclick = () => seek(ev.timecode_sec);
     track.append(mark);
   });
 
   const list = $("events");
   list.replaceChildren();
+  const observationList = $("observations");
+  observationList.replaceChildren();
+  $("qualified-section").hidden = !found;
+  $("observations-section").hidden = observations.length === 0;
+  $("track-legend").hidden = observations.length === 0;
+  $("track-qualified").hidden = !found;
   const tpl = $("event-tpl");
-  items.forEach((ev, index) => {
+  items.forEach(({ event: ev, index, observation }) => {
     const node = tpl.content.cloneNode(true);
     const tc = node.querySelector(".timecode");
     const formatted = fmt(ev.timecode_sec);
@@ -520,6 +556,15 @@ function render(job) {
       clipPlayer.onerror = () => { node.querySelector(".event-clip").hidden = true; };
     }
 
+    if (observation) {
+      node.querySelector(".event").classList.add("observation");
+      node.querySelector(".observation-review").hidden = false;
+      node.querySelector(".review-reason").textContent = ev.review_reason || "Для оценки эпизода требуется проверка человеком.";
+      node.querySelector(".basis").remove();
+      node.querySelector(".review").remove();
+      observationList.append(node);
+      return;
+    }
     node.querySelector(".basis-doc").textContent = [ev.source?.document, ev.source?.section].filter(Boolean).join(", ") || "Источник не указан";
     setSourceLink(node.querySelector(".basis-link"), ev.source);
 
@@ -563,8 +608,8 @@ function render(job) {
     list.append(node);
   });
 
-  $("clean").hidden = found;
-  if (!found) $("checks").open = true;
+  $("clean").hidden = found || reviewRequired;
+  if (!found && !reviewRequired) $("checks").open = true;
   $("r-file").textContent = job.filename || "Имя файла недоступно";
   const createdAt = Number(job.created_at);
   $("r-date").textContent = Number.isFinite(createdAt) && createdAt > 0

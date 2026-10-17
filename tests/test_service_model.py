@@ -241,7 +241,7 @@ def test_job_failure_never_logs_scene_descriptions(service, caplog, error_kind):
                and record.levelno >= logging.ERROR]
     assert len(records) == 1
     assert type(error).__name__ in records[0].getMessage()
-    assert result["error"] in records[0].getMessage()
+    assert "reason_code=" in records[0].getMessage()
     assert records[0].exc_info is None
 
 
@@ -292,6 +292,7 @@ def test_qwen_uses_root_relative_paths_and_offline_backend(monkeypatch, tmp_path
     import analyzer.qwen as module
 
     monkeypatch.setattr(module, "ROOT", tmp_path)
+    monkeypatch.setattr(module, "load_observations", lambda _: [])
     monkeypatch.setenv("CASHLENS_MODEL_DIR", "model")
     monkeypatch.setenv("CASHLENS_RULES", "config/rules.json")
     monkeypatch.setenv("CASHLENS_SAMPLE_FPS", "0.5")

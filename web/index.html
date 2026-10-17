@@ -19,8 +19,8 @@
     <section class="intake" aria-labelledby="intake-title">
       <h1 id="intake-title">Загрузите запись с камеры кассы</h1>
       <p class="lead">
-        Сервис найдёт моменты, похожие на нарушение кассовой дисциплины, и покажет
-        таймкод, кадры и норму, на которую стоит опереться при проверке.
+        Сервис покажет наблюдаемые эпизоды с таймкодами, кадрами и контекстом.
+        Признаки по подключённым нормативным правилам выделяются отдельно.
       </p>
 
       <div class="model-panel">
@@ -75,6 +75,10 @@
           <video id="player" controls muted playsinline preload="metadata"></video>
           <div class="track" id="track" aria-label="Шкала записи с отметками событий"></div>
           <div class="track-scale"><span>00:00</span><span id="track-end"></span></div>
+          <div id="track-legend" class="track-legend" hidden>
+            <span id="track-qualified" class="qualified">По нормативным правилам</span>
+            <span class="observation">Требует проверки</span>
+          </div>
           <div class="viewer-actions">
             <button type="button" id="print" class="ghost">Распечатать отчёт</button>
             <a id="download" class="quiet-link" download="cashlens-result.json">Скачать JSON</a>
@@ -83,7 +87,15 @@
         </aside>
 
         <div class="findings">
-          <div id="events"></div>
+          <section id="qualified-section" aria-labelledby="qualified-title">
+            <h2 id="qualified-title" class="findings-title">Признаки по нормативным правилам</h2>
+            <div id="events"></div>
+          </section>
+          <section id="observations-section" hidden aria-labelledby="observations-title">
+            <h2 id="observations-title" class="findings-title">Наблюдаемые эпизоды — требуется проверка</h2>
+            <p class="muted observation-explanation">Эпизоды требуют оценки человеком. Автоматическая нормативная квалификация для них отсутствует.</p>
+            <div id="observations"></div>
+          </section>
           <div class="print-sign">
             <p>Решение проверяющего: ______________________________</p>
             <p>Проверяющий: ____________________ (ФИО, подпись)    Дата: ____________</p>
@@ -102,12 +114,16 @@
       <details id="checks">
         <summary id="checks-title">Что проверяет сервис</summary>
         <p id="limitations" class="muted">Сервис ищет видимые признаки по подключённым правилам. Результат требует проверки специалистом и не является окончательным юридическим заключением.</p>
+        <h3 class="coverage-heading">Нормативные правила</h3>
         <ul id="rules" class="rules"></ul>
+        <h3 class="coverage-heading">Наблюдаемые эпизоды</h3>
+        <p class="muted coverage-note">Видимые действия, для которых нужны оценка контекста и проверка человеком. Наличие эпизода само по себе не устанавливает нарушение нормы.</p>
+        <ul id="observation-types" class="rules"></ul>
         <div class="feedback-stats" aria-labelledby="stats-title">
           <h3 id="stats-title">Отметки проверяющих</h3>
           <p id="stats-status" class="muted" role="status">Загружаем отметки…</p>
           <ul id="stats-rules" class="rules"></ul>
-          <p class="muted">Это оценки найденных событий проверяющими, а не измеренная точность модели. Проверки без событий здесь не учитываются.</p>
+          <p class="muted">Это оценки срабатываний по нормативным правилам, а не измеренная точность модели. Наблюдаемые эпизоды и проверки без срабатываний здесь не учитываются.</p>
         </div>
       </details>
     </section>
@@ -127,6 +143,10 @@
         <h2 class="event-type"></h2>
       </header>
       <p class="event-desc"></p>
+      <div class="observation-review" hidden>
+        <span class="review-badge">Требует проверки</span>
+        <p class="review-reason"></p>
+      </div>
       <div class="frames"></div>
       <div class="event-clip" hidden>
         <p class="event-clip-title">Мини-клип с контекстом события</p>

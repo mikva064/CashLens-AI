@@ -45,13 +45,33 @@ class Violation(StrictModel):
     evidence_frames: list[EvidenceFrame] = Field(min_length=1, max_length=3)
 
 
+class ObservationDefinition(StrictModel):
+    id: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
+    title: str = Field(min_length=1)
+    observable_condition: str = Field(min_length=10)
+    description_template: str = Field(min_length=1, max_length=1000)
+    review_reason: str = Field(min_length=10, max_length=1600)
+
+
+class Observation(StrictModel):
+    observation_id: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
+    type: str = Field(min_length=1)
+    timecode_sec: float = Field(ge=0)
+    description: str = Field(min_length=1)
+    evidence_frames: list[EvidenceFrame] = Field(min_length=1, max_length=3)
+    review_reason: str = Field(min_length=10)
+
+
 class AnalysisResult(StrictModel):
     schema_version: Literal["1.0"] = "1.0"
-    verdict: Literal["violation", "no_violation"]
+    verdict: Literal["violation", "no_violation", "requires_review"]
     violations: list[Violation]
+    observations: list[Observation] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def verdict_matches_events(self):
-        if (self.verdict == "violation") != bool(self.violations):
-            raise ValueError("verdict must agree with the presence of violations")
+        expected = ("violation" if self.violations else
+                    "requires_review" if self.observations else "no_violation")
+        if self.verdict != expected:
+            raise ValueError("verdict must agree with qualified violations and review observations")
         return self

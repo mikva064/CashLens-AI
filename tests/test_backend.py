@@ -115,7 +115,7 @@ class BackendTests(unittest.TestCase):
 
     def test_offline_generation_expands_compact_indices_to_absolute_times(self):
         torch, transformers, model, processor, batch = self.fake_dependencies()
-        raw = '  {"e":[{"r":0,"f":1}]}  '
+        raw = '  {"e":[{"k":"demo_rule","f":1}]}  '
         processor.batch_decode.return_value = [raw]
         with patch.dict(sys.modules, self.dependency_modules(torch, transformers)), patch.dict(os.environ):
             result = self.backend.describe(self.frames, RULES, timeout_sec=7.5)
@@ -149,9 +149,9 @@ class BackendTests(unittest.TestCase):
         schema = schema_call.args[0]
         self.assertEqual(schema["properties"]["e"]["maxItems"], 3)
         event_properties = schema["properties"]["e"]["items"]["properties"]
-        self.assertEqual(event_properties["r"]["enum"], [0])
+        self.assertEqual(event_properties["k"]["enum"], ["demo_rule"])
         self.assertEqual(event_properties["f"]["enum"], [0, 1])
-        self.assertEqual(set(event_properties), {"r", "f"})
+        self.assertEqual(set(event_properties), {"k", "f"})
         self.assertIn("Я", schema_call.kwargs["config"].alphabet)
         self.assertTrue(schema_call.kwargs["config"].force_json_field_order)
         self.assertIs(transformers._lmfe.JsonSchemaParser.return_value.config,
@@ -160,13 +160,13 @@ class BackendTests(unittest.TestCase):
         all_text = " ".join(item.get("text", "") for item in chat[0]["content"])
         self.assertIn("10.250000 seconds", all_text)
         self.assertIn("11.500000 seconds", all_text)
-        self.assertIn('"r": 0', all_text)
+        self.assertIn('"k": "demo_rule"', all_text)
         self.assertIn("Frame f=1", all_text)
         self.assertNotIn('"id": "demo_rule"', all_text)
         self.assertIn("Never identify people", all_text)
         self.assertIn("Do not invent laws", all_text)
         self.assertIn("First establish the visible scene", all_text)
-        self.assertIn("transaction sequence needed to satisfy EVERY", all_text)
+        self.assertIn("complete sequence before and after", all_text)
         self.assertIn('evidence is missing, return {"e":[]}', all_text)
         self.assertEqual(processor.call_args.kwargs["images"], [frame.image for frame in self.frames])
 
@@ -236,10 +236,8 @@ class BackendTests(unittest.TestCase):
         schema = transformers._lmfe.JsonSchemaParser.call_args.args[0]
         times = schema["properties"]["e"]["items"]["properties"]["f"]
         self.assertEqual(times["enum"], [1])
-        self.assertEqual(schema["properties"]["e"]["maxItems"], 1)
-        description = schema["properties"]["e"]["items"]["properties"]["d"]
-        self.assertEqual(description["maxLength"], 96)
-        self.assertNotIn("enum", description)
+        self.assertEqual(schema["properties"]["e"]["maxItems"], 3)
+        self.assertEqual(set(schema["properties"]["e"]["items"]["properties"]), {"k", "b", "f", "a", "c"})
 
     def test_generation_diagnostics_contain_only_safe_metadata(self):
         torch, transformers, model, processor, _ = self.fake_dependencies()
@@ -247,8 +245,9 @@ class BackendTests(unittest.TestCase):
         model.generate.return_value.__getitem__.return_value.shape = (1, 384)
         with patch.dict(sys.modules, self.dependency_modules(torch, transformers)), patch.dict(os.environ):
             with self.assertLogs("cashlens.model", level="INFO") as logs:
-                with self.assertRaises(InvalidModelOutputError):
+                with self.assertRaises(InvalidModelOutputError) as caught:
                     self.backend.describe(self.frames, RULES)
+        self.assertEqual(caught.exception.reason_code, "response_truncated")
         diagnostic = " ".join(logs.output)
         self.assertIn("phase=coarse nframes=2 generated_tokens=384", diagnostic)
         self.assertIn("complete_json=False", diagnostic)
@@ -260,14 +259,23 @@ class BackendTests(unittest.TestCase):
         self.assertIn("'reserved_mib': 456", diagnostic)
         self.assertIn("'peak_allocated_mib': 789", diagnostic)
 
+    def test_complete_json_with_invalid_trailing_text_is_not_labeled_truncation(self):
+        torch, transformers, model, processor, _ = self.fake_dependencies()
+        processor.batch_decode.return_value = ['{"e":[]} PRIVATE_TRAILING_TEXT']
+        model.generate.return_value.__getitem__.return_value.shape = (1, 384)
+        with patch.dict(sys.modules, self.dependency_modules(torch, transformers)), patch.dict(os.environ):
+            with self.assertRaises(InvalidModelOutputError) as caught:
+                self.backend.describe(self.frames, RULES)
+        self.assertEqual(caught.exception.reason_code, "invalid_compact_json")
+
     def test_prompts_use_bounded_phase_specific_descriptions(self):
         coarse = _build_prompt(RULES, "coarse")
         fine = _build_prompt(RULES, "fine")
         self.assertNotIn('{"e":[{"r":0,"f":0}]}', coarse)
         self.assertNotIn(COARSE_DESCRIPTION, coarse)
-        self.assertIn("Do not narrate or explain candidates", coarse)
-        self.assertIn("at most ONE event", fine)
-        self.assertIn("at most 12 words and 96 characters", fine)
+        self.assertIn("Do not emit a description", coarse)
+        self.assertIn("at most three events", fine)
+        self.assertIn("correct their category", fine)
         self.assertNotIn(COARSE_DESCRIPTION, fine)
         self.assertIn("b (before), f (decisive action), a (after), c (cash/service", fine)
         self.assertIn("Require b < f < a", fine)
@@ -365,85 +373,75 @@ class GpuPacingTests(unittest.TestCase):
 
 
 class CompactWireTests(unittest.TestCase):
-    def test_coarse_indices_restore_trusted_id_and_exact_global_timestamp(self):
+    def test_semantic_keys_restore_trusted_id_and_exact_global_timestamp(self):
         rules = RULES + [{**RULES[0], "id": "another_reviewed_rule"}]
         timestamps = [123.1234567890123, 124.987654321]
-        result = json.loads(_expand_wire_response('{"e":[{"r":1,"f":0}]}', rules, timestamps))
+        result = json.loads(_expand_wire_response('{"e":[{"k":"another_reviewed_rule","f":0}]}', rules, timestamps))
         self.assertEqual(result, {"events": [{"rule_id": "another_reviewed_rule",
                          "timecode_sec": timestamps[0], "description": COARSE_DESCRIPTION}]})
         self.assertEqual(_expand_wire_response('{"e":[]}', rules, timestamps), '{"events":[]}')
 
-    def test_fine_uses_sole_rule_and_expands_existing_pipeline_schema(self):
+    def test_fine_proof_expands_existing_pipeline_schema_with_trusted_template(self):
         from cashlens_ai.pipeline import parse_model_response
-
         timestamps = [120.123456789, 121.987654321, 125.123456789]
-        text = _expand_wire_response('{"e":[{"b":0,"f":1,"a":2,"c":0,"d":"Тестовое действие."}]}',
-                                     RULES, timestamps, "fine", candidate_timecode_sec=timestamps[1],
+        rules = [{**RULES[0], "description_template": "Тестовое действие."}]
+        text = _expand_wire_response('{"e":[{"k":"demo_rule","b":0,"f":1,"a":2,"c":0}]}',
+                                     rules, timestamps, "fine", candidate_timecodes_sec=[timestamps[1]],
                                      candidate_radius_sec=0.5)
-        result = parse_model_response(text, allowed_ids={"demo_rule"},
-                                      first_sec=timestamps[0], last_sec=timestamps[-1],
-                                      require_proof=True, frame_timestamps=timestamps,
-                                      candidate_timecode_sec=timestamps[1], candidate_radius_sec=0.5)
+        result = parse_model_response(text, allowed_ids={"demo_rule"}, first_sec=timestamps[0],
+            last_sec=timestamps[-1], require_proof=True, frame_timestamps=timestamps,
+            candidate_timecodes_sec=[timestamps[1]], candidate_radius_sec=0.5)
         self.assertEqual(result[0].rule_id, "demo_rule")
         self.assertEqual(result[0].timecode_sec, timestamps[1])
         self.assertEqual(result[0].description, "Тестовое действие.")
         self.assertEqual(result[0].evidence_timestamps_sec, timestamps)
-        self.assertEqual(result[0].cash_context_timestamp_sec, timestamps[0])
 
-    def test_rule_permutation_preserves_the_selected_semantic_rule(self):
+    def test_permutation_preserves_semantic_rule_and_identical_prompt(self):
         other = {**RULES[0], "id": "another_reviewed_rule"}
-        for rules, index in ((RULES + [other], 1), ([other] + RULES, 0)):
-            result = json.loads(_expand_wire_response(
-                json.dumps({"e": [{"r": index, "f": 0}]}), rules, [12.0]))
+        orders = (RULES + [other], [other] + RULES)
+        for rules in orders:
+            result = json.loads(_expand_wire_response('{"e":[{"k":"another_reviewed_rule","f":0}]}', rules, [12.]))
             self.assertEqual(result["events"][0]["rule_id"], other["id"])
+        self.assertEqual(_build_prompt(orders[0], "coarse"), _build_prompt(orders[1], "coarse"))
 
-    def test_invalid_or_ambiguous_indices_never_become_clean_events(self):
-        for event in ({"r": True, "f": 0}, {"r": 0, "f": False}, {"r": 0.0, "f": 0},
-                      {"r": 0, "f": 1.0}, {"r": "0", "f": 0}, {"r": -1, "f": 0},
-                      {"r": 1, "f": 0}, {"r": 0, "f": -1}, {"r": 0, "f": 2},
-                      {"r": 0}, {"r": 0, "f": 0, "law": "invented"}):
+    def test_invalid_indices_keys_and_extra_legal_fields_fail_closed(self):
+        for event in ({"k": True, "f": 0}, {"k": "unknown", "f": 0}, {"k": "demo_rule", "f": False},
+                      {"k": "demo_rule", "f": 1.0}, {"k": "demo_rule", "f": -1},
+                      {"k": "demo_rule", "f": 2}, {"k": "demo_rule"},
+                      {"k": "demo_rule", "f": 0, "law": "invented"}):
             with self.subTest(event=event), self.assertRaises(InvalidModelOutputError):
-                _expand_wire_response(json.dumps({"e": [event]}), RULES, [12.0, 13.0])
+                _expand_wire_response(json.dumps({"e": [event]}), RULES, [12., 13.])
 
     def test_invalid_json_duplicate_keys_and_nonfinite_constants_are_rejected(self):
-        for text in ('{"e":', '{"e":[],"e":[]}', '{"e":[{"r":0,"r":0,"f":0}]}',
-                     '{"e":[{"r":0,"f":NaN}]}', '{"e":[]} trailing',
+        for text in ('{"e":', '{"e":[],"e":[]}', '{"e":[{"k":"demo_rule","k":"demo_rule","f":0}]}',
+                     '{"e":[{"k":"demo_rule","f":NaN}]}', '{"e":[]} trailing',
                      '{"events":[]}', '{"e":null}', '{"e":{}}', '[]'):
             with self.subTest(text=text), self.assertRaises(InvalidModelOutputError):
-                _expand_wire_response(text, RULES, [12.0])
-
-    def test_fine_description_and_cardinality_are_validated(self):
-        valid = {"b": 0, "f": 1, "a": 2, "c": 0, "d": "x"}
-        for event in ({**valid, "d": ""}, {**valid, "d": " "}, {**valid, "d": False},
-                      {**valid, "d": "x" * (DESCRIPTION_MAX_CHARS + 1)},
-                      {**valid, "f": True}, {**valid, "r": 0}):
-            with self.subTest(event=event), self.assertRaises(InvalidModelOutputError):
-                _expand_wire_response(json.dumps({"e": [event]}), RULES, [12.0, 13.0, 14.0], "fine",
-                                      candidate_timecode_sec=13.0, candidate_radius_sec=0.5)
-        for phase, event, count in (("coarse", {"r": 0, "f": 0}, 4),
-                                    ("fine", valid, 2)):
-            with self.subTest(phase=phase), self.assertRaises(InvalidModelOutputError):
-                _expand_wire_response(json.dumps({"e": [event] * count}), RULES, [12.0, 13.0, 14.0], phase,
-                                      candidate_timecode_sec=13.0, candidate_radius_sec=0.5)
+                _expand_wire_response(text, RULES, [12.])
 
     def test_fine_rejects_missing_reversed_unrelated_or_unfocused_proof(self):
-        valid = {"b": 0, "f": 1, "a": 2, "c": 0, "d": "x"}
-        invalid = [{key: value for key, value in valid.items() if key != missing}
-                   for missing in ("b", "a", "c")]
-        invalid += [{**valid, "b": 1}, {**valid, "a": 0}, {**valid, "c": 3},
-                    {**valid, "b": False}, {**valid, "a": 99},
-                    {**valid, "f": 2, "a": 3}]
+        valid = {"k": "demo_rule", "b": 0, "f": 1, "a": 2, "c": 0}
+        invalid = [{key: value for key, value in valid.items() if key != missing} for missing in ("b", "a", "c", "k")]
+        invalid += [{**valid, "b": 1}, {**valid, "a": 0}, {**valid, "c": 3}, {**valid, "b": False},
+                    {**valid, "a": 99}, {**valid, "f": 2, "a": 3}, {**valid, "d": "untrusted prose"}]
         for event in invalid:
             with self.subTest(event=event), self.assertRaises(InvalidModelOutputError):
-                _expand_wire_response(json.dumps({"e": [event]}), RULES, [12., 13., 14., 15.], "fine",
-                                      candidate_timecode_sec=13., candidate_radius_sec=0.25)
+                _expand_wire_response(json.dumps({"e": [event]}), RULES, [12.,13.,14.,15.], "fine",
+                                      candidate_timecodes_sec=[13.], candidate_radius_sec=0.25)
         with self.assertRaises(InvalidModelOutputError):
-            _expand_wire_response(json.dumps({"e": [valid]}), RULES, [12., 13., 13.], "fine",
-                                  candidate_timecode_sec=13., candidate_radius_sec=0.25)
+            _expand_wire_response(json.dumps({"e": [valid]}), RULES, [12.,13.,13.], "fine",
+                                  candidate_timecodes_sec=[13.], candidate_radius_sec=0.25)
 
-    def test_fine_requires_one_trusted_rule(self):
-        with self.assertRaises(ValueError):
-            _build_output_schema(RULES + [{**RULES[0], "id": "second_rule"}], [12.0], "fine")
+    def test_fine_batch_can_correct_type_and_use_any_candidate_focus(self):
+        rules = RULES + [{**RULES[0], "id": "corrected_category"}]
+        events = [{"k":"demo_rule","b":0,"f":1,"a":2,"c":1},
+                  {"k":"corrected_category","b":2,"f":3,"a":4,"c":3}]
+        result = json.loads(_expand_wire_response(json.dumps({"e":events}), rules, [10.,11.,12.,13.,14.],
+            "fine", candidate_timecodes_sec=[11.,13.], candidate_radius_sec=0.2))
+        self.assertEqual([event["rule_id"] for event in result["events"]], ["demo_rule","corrected_category"])
+        with self.assertRaises(InvalidModelOutputError):
+            _expand_wire_response(json.dumps({"e":[events[0]]*2}), rules, [10.,11.,12.,13.,14.],
+                "fine", candidate_timecodes_sec=[11.], candidate_radius_sec=0.2)
 
 
 class JsonStoppingTests(unittest.TestCase):
@@ -524,7 +522,7 @@ class ConstrainedSchemaTests(unittest.TestCase):
 
     @staticmethod
     def event(**changes):
-        result = {"r": 0, "f": 0}
+        result = {"k": "demo_rule", "f": 0}
         result.update(changes)
         return result
 
@@ -535,16 +533,15 @@ class ConstrainedSchemaTests(unittest.TestCase):
                 self.assertTrue(self.accepts(json.dumps(value, ensure_ascii=False)))
 
     def test_unknown_rule_and_frame_indices_are_blocked(self):
-        for event in (self.event(r=1), self.event(f=2), self.event(r=-1), self.event(f=True)):
+        for event in (self.event(k="unknown"), self.event(f=2), self.event(k=True), self.event(f=True)):
             with self.subTest(event=event):
                 self.assertFalse(self.accepts(json.dumps({"e": [event]}, ensure_ascii=False)))
 
-    def test_fine_accepts_one_short_description_and_blocks_long_or_multiple_events(self):
-        event = {"b": 0, "f": 1, "a": 2, "c": 0, "d": "Тестовое видимое действие."}
-        self.assertTrue(self.accepts(json.dumps({"e": [event]}, ensure_ascii=False), "fine"))
-        self.assertFalse(self.accepts(json.dumps({"e": [event, event]}, ensure_ascii=False), "fine"))
-        event = {**event, "d": "x" * (DESCRIPTION_MAX_CHARS + 1)}
-        self.assertFalse(self.accepts(json.dumps({"e": [event]}, ensure_ascii=False), "fine"))
+    def test_fine_grammar_is_bounded_structured_proof_without_generated_prose(self):
+        event = {"k":"demo_rule", "b":0,"f":1,"a":2,"c":0}
+        self.assertTrue(self.accepts(json.dumps({"e":[event]}), "fine"))
+        self.assertFalse(self.accepts(json.dumps({"e":[event]*4}), "fine"))
+        self.assertFalse(self.accepts(json.dumps({"e":[{**event,"d":"not allowed"}]}), "fine"))
 
     def test_coarse_description_cannot_be_generated(self):
         event = self.event(description="Произвольное описание кандидата")
@@ -600,7 +597,7 @@ class LocalTokenizerGrammarTests(unittest.TestCase):
                 self.assertIn(self.tokenizer.eos_token_id, prefix(0, torch.tensor(sequence)))
 
     def test_compact_candidates_use_fewer_output_tokens_without_changing_frames(self):
-        wire = '{"e":[{"r":0,"f":0},{"r":0,"f":1},{"r":0,"f":0}]}'
+        wire = '{"e":[{"k":"demo_rule","f":0},{"k":"demo_rule","f":1}]}'
         expanded = _expand_wire_response(wire, RULES, [120.123456789, 121.987654321])
         compact_count = len(self.tokenizer.encode(wire, add_special_tokens=False))
         expanded_count = len(self.tokenizer.encode(expanded, add_special_tokens=False))

@@ -25,9 +25,25 @@ def web_result(job: dict, jobs_dir: Path) -> dict:
         if clip and clip.get("filename") == filename and (job_dir / "clips" / filename).is_file():
             item["clip_url"] = f"/media/{job['id']}/clips/{filename}"
         events.append(item)
+    observations = []
+    for index, event in enumerate(result.observations):
+        frames = []
+        for frame in event.evidence_frames:
+            relative = frame.image_path.resolve().relative_to(job_dir)
+            frames.append({"timestamp_sec": frame.timestamp_sec,
+                           "url": f"/media/{job['id']}/{relative.as_posix()}"})
+        item = {"observation_id": event.observation_id, "type": event.type,
+                "timecode_sec": event.timecode_sec, "description": event.description,
+                "review_reason": event.review_reason, "evidence_frames": frames}
+        filename = f"observation_{index + 1:03d}.mp4"
+        clip = stored.get("observation_clips", {}).get(str(index))
+        if clip and clip.get("filename") == filename and (job_dir / "clips" / filename).is_file():
+            item["clip_url"] = f"/media/{job['id']}/clips/{filename}"
+        observations.append(item)
     completed_at = stored.get("completed_at") or job.get("finished_at") or job["created_at"]
     return {"job_id": job["id"], "status": "done", "verdict": result.verdict,
-            "violations": events, "filename": job["filename"], "created_at": job["created_at"],
+            "violations": events, "observations": observations, "review_required": bool(observations),
+            "filename": job["filename"], "created_at": job["created_at"],
             "video_url": f"/media/{job['id']}/preview.mp4",
             "original_url": f"/media/{job['id']}/video.mov",
             "analyzer": stored["analyzer"], "duration_sec": stored["duration_sec"],

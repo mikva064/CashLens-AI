@@ -65,13 +65,14 @@ class RecordingBackend:
         self.callback = callback or (lambda phase, frames, rules: response())
 
     def describe(self, frames, rules, *, phase="coarse", timeout_sec=None,
-                 candidate_timecode_sec=None, candidate_radius_sec=None):
+                 candidate_timecode_sec=None, candidate_timecodes_sec=None, candidate_radius_sec=None):
         self.calls.append({
             "phase": phase,
             "timestamps": [frame.timestamp_sec for frame in frames],
             "rules": rules,
             "timeout_sec": timeout_sec,
-            "candidate_timecode_sec": candidate_timecode_sec,
+            "candidate_timecode_sec": candidate_timecode_sec if candidate_timecodes_sec is None else candidate_timecodes_sec[0],
+            "candidate_timecodes_sec": candidate_timecodes_sec,
             "candidate_radius_sec": candidate_radius_sec,
         })
         return self.callback(phase, frames, rules)

@@ -17,7 +17,9 @@ from cashlens_ai.errors import (AnalysisTimeoutError, InvalidModelOutputError,
 
 log = logging.getLogger("cashlens.worker")
 state = {"analyzer": None, "ready": False, "error": None, "status": "stopped",
-         "model_name": None, "rule_count": 0, "rules": [], "limitations": "", "performance": {}}
+         "model_name": None, "rule_count": 0, "rules": [], "limitations": "", "performance": {},
+         "observation_type_count": 0, "observation_types": [], "pipeline_revision": None,
+         "catalog_hash": None}
 _state_lock = threading.Lock()
 _thread: threading.Thread | None = None
 _POLL_SEC = 0.05
@@ -52,7 +54,8 @@ def _public_error(exc: Exception, *, loading: bool = False) -> str:
 
 def _error_message(exc: Exception, job_id: str | None = None, *, loading: bool = False) -> dict:
     return {"kind": "load_failed" if loading else "failed", "job_id": job_id,
-            "error_type": type(exc).__name__, "error": _public_error(exc, loading=loading)}
+            "error_type": type(exc).__name__, "error": _public_error(exc, loading=loading),
+            "reason_code": InvalidModelOutputError.safe_reason_code(getattr(exc, "reason_code", None))}
 
 
 def _execute_job(analyzer, command: dict) -> Path:
@@ -82,8 +85,14 @@ def _execute_job(analyzer, command: dict) -> Path:
             bounds = media.make_event_clip(src, event.timecode_sec, job_dir / "clips" / filename,
                                            duration_sec=duration)
             clips[str(index)] = {"filename": filename, **bounds}
+        observation_clips = {}
+        for index, event in enumerate(result.observations):
+            filename = f"observation_{index + 1:03d}.mp4"
+            bounds = media.make_event_clip(src, event.timecode_sec, job_dir / "clips" / filename,
+                                           duration_sec=duration)
+            observation_clips[str(index)] = {"filename": filename, **bounds}
         record = {"analysis": result.model_dump(mode="json"), "analyzer": analyzer.name,
-                  "duration_sec": duration, "clips": clips}
+                  "duration_sec": duration, "clips": clips, "observation_clips": observation_clips}
     finally:
         # No preview is allowed to accumulate behind successful or failed jobs.
         # A stuck conversion is bounded by the parent's hard process deadline.
@@ -96,6 +105,10 @@ def _execute_job(analyzer, command: dict) -> Path:
 
 
 def _child_main(connection, gate, factory=None) -> None:
+    # Spawned children do not inherit the API's configured root logger. Only
+    # fixed failure codes and numeric generation metadata are logged below.
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s",
+                        force=True)
     initialize_child_process_group()
     if not gate.wait(timeout=15):
         return
@@ -201,7 +214,9 @@ def _wait_ready(stop: threading.Event, runner) -> bool:
         message = runner.poll(_POLL_SEC)
         if message and message.get("kind") == "ready":
             allowed = {key: value for key, value in message.get("capabilities", {}).items()
-                       if key in {"model_name", "rule_count", "rules", "limitations", "performance"}}
+                       if key in {"model_name", "rule_count", "rules", "limitations", "performance",
+                                  "observation_type_count", "observation_types", "pipeline_revision",
+                                  "catalog_hash"}}
             _update(**allowed, analyzer=message["analyzer"], ready=True, status="ready", error=None)
             log.info("analyzer %s loaded in model process", message["analyzer"])
             return True
@@ -224,7 +239,7 @@ def _finalize_job(job_id: str, result_path: Path, processing_started_at: float) 
         raise InvalidModelOutputError("Unexpected model result artifact")
     stored = json.loads(expected.read_text(encoding="utf-8"))
     result = AnalysisResult.model_validate(stored["analysis"])
-    for event in result.violations:
+    for event in [*result.violations, *result.observations]:
         for frame in event.evidence_frames:
             path = frame.image_path.resolve(strict=True)
             if not path.is_relative_to(job_dir / "ai") or not path.is_file():
@@ -235,6 +250,11 @@ def _finalize_job(job_id: str, result_path: Path, processing_started_at: float) 
         if (clips.get(str(index), {}).get("filename") != filename
                 or not (job_dir / "clips" / filename).is_file()):
             raise InvalidModelOutputError("Event clip is missing")
+    for index in range(len(result.observations)):
+        filename = f"observation_{index + 1:03d}.mp4"
+        if (stored.get("observation_clips", {}).get(str(index), {}).get("filename") != filename
+                or not (job_dir / "clips" / filename).is_file()):
+            raise InvalidModelOutputError("Observation clip is missing")
     stored["analysis"] = result.model_dump(mode="json")
     stored["timings"] = {"queue_sec": round(processing_started_at - job["created_at"], 2),
                          "processing_sec": round(time.time() - processing_started_at, 2)}
@@ -280,7 +300,8 @@ def _process_job(stop: threading.Event, runner, job_id: str) -> bool:
         if not message or message.get("job_id") != job_id:
             continue
         if message["kind"] == "failed":
-            log.error("analysis failed (%s): %s", message["error_type"], message["error"])
+            reason_code = InvalidModelOutputError.safe_reason_code(message.get("reason_code"))
+            log.error("analysis failed (%s) reason_code=%s", message["error_type"], reason_code)
             restart_codes = {"ModelUnavailableError": "model_unavailable",
                              "AnalysisTimeoutError": "analysis_timeout"}
             code = restart_codes.get(message["error_type"], "analysis_failed")
@@ -349,7 +370,8 @@ def start() -> threading.Event:
     if _thread is not None and _thread.is_alive():
         raise RuntimeError("The previous analyzer worker is still running")
     _update(analyzer=os.getenv("CASHLENS_ANALYZER", "model").strip().lower(), ready=False,
-            error=None, status="loading", model_name=None, rule_count=0, rules=[], limitations="", performance={})
+            error=None, status="loading", model_name=None, rule_count=0, rules=[], limitations="", performance={},
+            observation_type_count=0, observation_types=[], pipeline_revision=None, catalog_hash=None)
     stop = threading.Event()
     _thread = threading.Thread(target=_loop, args=(stop,), name="cashlens-supervisor", daemon=True)
     _thread.start()

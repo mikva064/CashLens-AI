@@ -41,10 +41,12 @@ def main(argv=None):
     download.add_argument("--repo", default="Qwen/Qwen3-VL-2B-Instruct")
     download.add_argument("--revision", default="main")
     download.add_argument("--output", type=Path, default=Path("local/models/qwen3-vl-2b"))
-    analyze = commands.add_parser("analyze", help="Analyze using local weights and verified rules")
+    analyze = commands.add_parser("analyze", help="Analyze local video for qualified and review findings")
     analyze.add_argument("video", type=Path)
     analyze.add_argument("--model-dir", type=Path, required=True)
     analyze.add_argument("--rules", type=Path, default=Path("config/rules.json"))
+    analyze.add_argument("--observations", type=Path,
+                         help="Local observation catalog (default: observations.json beside --rules; must exist)")
     analyze.add_argument("--output", type=Path, required=True)
     analyze.add_argument("--budget", type=float, default=240.0)
     args = parser.parse_args(argv)
@@ -104,10 +106,12 @@ def main(argv=None):
             from . import analyze_video
             from .pipeline import AnalyzerConfig
             result = analyze_video(args.video, model_dir=args.model_dir, rules_path=args.rules,
-                                   output_dir=args.output,
+                                   output_dir=args.output, observations_path=args.observations,
                                    config=AnalyzerConfig(time_budget_sec=args.budget))
             # Full descriptions stay in the local result.json, not console logs.
             _print({"verdict": result.verdict, "event_count": len(result.violations),
+                    "observation_count": len(result.observations),
+                    "review_required": bool(result.observations),
                     "result_path": str(args.output.resolve() / "result.json")})
     except (CashLensError, OSError, ValueError, ImportError) as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)

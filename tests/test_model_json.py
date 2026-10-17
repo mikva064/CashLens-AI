@@ -60,7 +60,7 @@ class LocalModelFormattingTests(unittest.TestCase):
         ), [])
         with self.assertRaises(InvalidModelOutputError):
             parse_model_response(
-                json.dumps({"events": [valid, valid]}), allowed_ids={"test_rule"}, first_sec=0, last_sec=2,
+                json.dumps({"events": [valid] * 4}), allowed_ids={"test_rule"}, first_sec=0, last_sec=2,
                 require_proof=True, frame_timestamps=[0.0, 1.0, 2.0],
                 candidate_timecode_sec=1, candidate_radius_sec=0.25,
             )

@@ -27,6 +27,8 @@
   --clear: #1e7a57;        /* «нарушений нет» */
   --clear-soft: #e5f2ec;
   --focus: #e2206f;
+  --review: #925600;
+  --review-soft: #fff1d5;
 }
 
 * { box-sizing: border-box; }
@@ -172,6 +174,7 @@ progress { width: 100%; margin-top: 12px; accent-color: var(--crimson); }
   transform-origin: left center;
 }
 .verdict.clear { background: var(--clear); }
+.verdict.review-required { background: var(--review-soft); color: #664000; border: 1px solid #d5ac62; }
 .verdict-title { margin: 0; font-size: clamp(20px, 3vw, 28px); font-weight: 700; line-height: 1.2; }
 .verdict-meta { margin: 4px 0 0; opacity: .85; font-size: 15px; }
 @media (prefers-reduced-motion: no-preference) {
@@ -213,6 +216,11 @@ video {
   background: var(--crimson);
   transform: translateX(-3px);
 }
+.track button.observation { background: var(--review); }
+.track-legend { margin-top: 8px; display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; color: var(--slate); }
+.track-legend[hidden] { display: none; }
+.track-legend span::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 5px; border-radius: 50%; background: var(--crimson); }
+.track-legend .observation::before { background: var(--review); }
 .track .head {
   position: absolute;
   top: 0;
@@ -236,6 +244,13 @@ video {
 
 /* Событие: таймкод — главный элемент страницы. */
 .event { padding: 4px 0 28px; }
+.findings-title { margin: 0 0 18px; font-size: 18px; line-height: 1.4; }
+#observations-section { margin-top: 24px; }
+.observation-explanation { margin: -6px 0 20px; font-size: 14px; }
+.event.observation .timecode { color: var(--review); }
+.observation-review { margin: 10px 0 16px; padding: 12px 14px; border-left: 3px solid var(--review); background: var(--review-soft); }
+.review-badge { font-weight: 600; color: #664000; }
+.review-reason { margin: 6px 0 0; font-size: 14px; }
 .event + .event { padding-top: 28px; border-top: 1px solid var(--line); }
 .event-head { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
 .timecode {
@@ -308,6 +323,8 @@ video {
 /* Что проверяет сервис */
 .checks { padding: 32px 0 8px; }
 .checks summary { cursor: pointer; font-weight: 600; font-size: 18px; }
+.coverage-heading { margin: 20px 0 8px; font-size: 16px; }
+.coverage-note { max-width: 760px; font-size: 14px; }
 .rules { margin: 12px 0 0; padding: 0; list-style: none; max-width: 760px; }
 .rules li { padding: 12px 0; border-top: 1px solid var(--line); }
 .rules strong { display: block; }
@@ -364,6 +381,8 @@ video {
     -webkit-print-color-adjust: exact; print-color-adjust: exact; }
   .layout { display: block; margin-top: 10pt; }
   .event { break-inside: avoid; padding: 10pt 0; }
+  .findings-title { font-size: 12pt; margin-bottom: 8pt; }
+  .observation-review { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
   .event + .event { padding-top: 10pt; }
   .timecode { font-size: 26pt; }
   .frames { overflow: visible; }
