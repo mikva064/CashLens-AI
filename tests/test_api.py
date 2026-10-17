@@ -103,5 +103,21 @@ def test_health_reports_analyzer(client):
     assert h["analyzer"] == "mock" and h["analyzer_ready"] is True
 
 
+def test_feedback_and_rules(client, video, monkeypatch):
+    monkeypatch.setenv("CASHLENS_MOCK_VERDICT", "violation")
+    with open(video, "rb") as f:
+        jid = client.post("/web/analyze", files={"file": ("sample.mov", f)}).json()["job_id"]
+    _wait(client, jid)
+    url = f"/web/jobs/{jid}/feedback"
+    assert client.post(url, json={"event_index": 0, "decision": "rejected"}).status_code == 200
+    assert client.post(url, json={"event_index": 0, "decision": "confirmed"}).status_code == 200
+    assert client.get(f"/web/jobs/{jid}").json()["feedback"] == {"0": "confirmed"}
+    assert client.post(url, json={"event_index": 5, "decision": "confirmed"}).status_code == 404
+    assert client.post(url, json={"event_index": 0, "decision": "maybe"}).status_code == 422
+
+    rules = client.get("/web/rules").json()
+    assert rules["analyzer"] == "mock" and isinstance(rules["rules"], list)
+
+
 def test_db_not_served(client):
     assert client.get("/media/../jobs.sqlite3").status_code == 404

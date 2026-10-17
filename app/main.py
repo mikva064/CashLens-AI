@@ -1,19 +1,23 @@
+import json
 import logging
+import os
 import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
 from app import db, media, worker
+from app.config import (ALLOWED_EXT, API_KEY, JOBS_DIR, JOB_TIMEOUT_SEC, MAX_UPLOAD_MB,
+                        ROOT, WEB_DIR, WEB_UPLOAD_ENABLED)
 from cashlens_ai.contracts import AnalysisResult
 from cashlens_ai.integration import to_api_payload
-from app.config import (ALLOWED_EXT, API_KEY, JOBS_DIR, JOB_TIMEOUT_SEC,
-                        MAX_UPLOAD_MB, WEB_DIR, WEB_UPLOAD_ENABLED)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
@@ -84,6 +88,7 @@ def _done_view(job: dict, for_api: bool) -> dict:
                   "url": "/media/" + f.image_path.resolve().relative_to(JOBS_DIR.resolve()).as_posix()}
                  for f in v.evidence_frames]}
             for v in result.violations]}
+        view["feedback"] = db.get_feedback(job["id"])
         view["video_url"] = f"/media/{job['id']}/preview.mp4"
         view["original_url"] = f"/media/{job['id']}/video.mov"
     view["analyzer"] = stored["analyzer"]
@@ -151,6 +156,39 @@ async def web_analyze(file: UploadFile = File(...)):
 def web_job(job_id: str):
     # Интерфейсу — ссылки на кадры вместо base64, чтобы опрос раз в 2 с был лёгким.
     return _job_view(_load(job_id), for_api=False)
+
+
+class Feedback(BaseModel):
+    event_index: int = Field(ge=0)
+    decision: Literal["confirmed", "rejected"]
+    comment: str | None = Field(default=None, max_length=500)
+
+
+@app.post("/web/jobs/{job_id}/feedback")
+def web_feedback(job_id: str, body: Feedback):
+    job = _load(job_id)
+    if job["status"] != "done" or body.event_index >= len(job["result"]["analysis"]["violations"]):
+        raise HTTPException(status_code=404, detail="Событие не найдено")
+    db.set_feedback(job_id, body.event_index, body.decision, body.comment)
+    return {"ok": True}
+
+
+@app.get("/web/rules")
+def web_rules():
+    """Что именно проверяет сервис — показываем пользователю, чтобы вердикт
+    «нарушение не обнаружено» не выглядел как чёрный ящик."""
+    path = Path(os.getenv("CASHLENS_RULES", ROOT / "config" / "rules.json"))
+    try:
+        rules = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        rules = []
+    return {
+        "analyzer": worker.state["analyzer"],
+        "ready": worker.state["ready"],
+        "rules": [{"id": r.get("id"), "title": r.get("title"),
+                   "condition": r.get("observable_condition"),
+                   "source": r.get("source")} for r in rules if r.get("verified")],
+    }
 
 
 app.mount("/media", StaticFiles(directory=JOBS_DIR), name="media")

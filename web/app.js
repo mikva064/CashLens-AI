@@ -3,12 +3,56 @@ const fileInput = $("file");
 const drop = $("drop");
 let pollTimer = null;
 
+/* ---------- Режим и список правил ---------- */
+
+async function loadRules() {
+  try {
+    const info = await (await fetch("/web/rules")).json();
+    const mode = $("mode");
+    mode.hidden = false;
+    if (info.analyzer === "model" && info.ready) {
+      mode.textContent = "Модель работает локально";
+      mode.classList.add("live");
+    } else if (info.analyzer === "model") {
+      mode.textContent = "Модель не загружена";
+    } else {
+      mode.textContent = "Демо-режим";
+    }
+    const list = $("rules");
+    list.replaceChildren();
+    if (!info.rules.length) {
+      const li = document.createElement("li");
+      li.textContent = "Список проверяемых правил ещё не заполнен.";
+      list.append(li);
+      return;
+    }
+    info.rules.forEach((r) => {
+      const li = document.createElement("li");
+      const title = document.createElement("strong");
+      title.textContent = r.title;
+      const cond = document.createElement("span");
+      cond.textContent = r.condition;
+      const src = document.createElement("span");
+      src.textContent = r.source ? `${r.source.document}, ${r.source.section}` : "";
+      li.append(title, cond, src);
+      list.append(li);
+    });
+  } catch {
+    /* интерфейс работает и без этого блока */
+  }
+}
+loadRules();
+
+/* ---------- Выбор файла ---------- */
+
 function setFile(file) {
   if (!file) return;
   const dt = new DataTransfer();
   dt.items.add(file);
   fileInput.files = dt.files;
-  $("drop-text").textContent = `${file.name} — ${(file.size / 1048576).toFixed(1)} МБ`;
+  $("drop-title").textContent = file.name;
+  $("drop-hint").textContent = `${(file.size / 1048576).toFixed(1)} МБ, готово к проверке`;
+  drop.classList.add("ready");
   $("submit").disabled = false;
 }
 
@@ -29,55 +73,74 @@ $("upload").addEventListener("submit", (ev) => {
   upload(file);
 });
 
+/* ---------- Этапы ---------- */
+
+const ORDER = ["upload", "queued", "processing", "done"];
+
+function setStep(step, text, isError = false) {
+  const steps = $("steps");
+  steps.hidden = false;
+  const idx = ORDER.indexOf(step);
+  steps.querySelectorAll("li").forEach((li, i) => {
+    li.className = i < idx || step === "done" ? "done" : i === idx ? "now" : "";
+  });
+  const status = $("status");
+  status.textContent = text;
+  status.classList.toggle("error", isError);
+}
+
+function fail(text) {
+  setStep("upload", text, true);
+  $("submit").disabled = false;
+}
+
 function upload(file) {
   const form = new FormData();
   form.append("file", file);
   const xhr = new XMLHttpRequest();
   xhr.open("POST", "/web/analyze");
-  $("progress").hidden = false;
   xhr.upload.onprogress = (e) => {
-    if (e.lengthComputable) $("progress").value = (e.loaded / e.total) * 100;
-    $("status").textContent = "Загрузка видео…";
+    const pct = e.lengthComputable ? Math.round((e.loaded / e.total) * 100) : 0;
+    setStep("upload", `Загружаем запись: ${pct}%`);
   };
   xhr.onload = () => {
-    $("progress").hidden = true;
-    const body = safeJson(xhr.responseText);
+    let body = null;
+    try { body = JSON.parse(xhr.responseText); } catch { /* не JSON */ }
     if (xhr.status !== 200) {
-      $("status").textContent = `Ошибка: ${body?.detail || xhr.status}`;
-      $("submit").disabled = false;
+      fail(`Не удалось загрузить: ${body?.detail || `ошибка сервера ${xhr.status}`}. Проверьте файл и попробуйте снова.`);
       return;
     }
     poll(body.job_id);
   };
-  xhr.onerror = () => {
-    $("status").textContent = "Сеть недоступна";
-    $("submit").disabled = false;
-  };
+  xhr.onerror = () => fail("Нет связи с сервером. Проверьте подключение и попробуйте снова.");
+  setStep("upload", "Загружаем запись: 0%");
   xhr.send(form);
 }
 
-function safeJson(text) {
-  try { return JSON.parse(text); } catch { return null; }
-}
-
 function poll(jobId) {
+  // Ссылка на результат: адрес с #job=… можно переслать коллеге.
+  history.replaceState(null, "", `#job=${jobId}`);
   const started = Date.now();
   const tick = async () => {
-    const res = await fetch(`/web/jobs/${jobId}`);
-    const job = await res.json();
+    let job;
+    try {
+      job = await (await fetch(`/web/jobs/${jobId}`)).json();
+    } catch {
+      return; // временный сбой сети — попробуем на следующем шаге
+    }
     const secs = Math.round((Date.now() - started) / 1000);
     if (job.stage === "queued") {
-      $("status").textContent = `В очереди (перед вами: ${job.queue_position}) · ${secs} с`;
+      setStep("queued", `Перед вами в очереди: ${job.queue_position}. Прошло ${secs} с.`);
     } else if (job.status === "processing") {
-      $("status").textContent = `Анализ видео… ${secs} с`;
+      setStep("processing", `Модель просматривает запись. Прошло ${secs} с, лимит — 5 минут.`);
     } else {
       clearInterval(pollTimer);
       $("submit").disabled = false;
       if (job.status === "done") {
-        $("status").textContent = `Готово за ${job.processing_time_sec} с`;
+        setStep("done", "Проверка завершена.");
         render(job);
       } else {
-        $("status").textContent = `Не удалось обработать: ${job.error}`;
+        fail(`Проверка не завершилась: ${job.error}`);
       }
     }
   };
@@ -85,76 +148,144 @@ function poll(jobId) {
   pollTimer = setInterval(tick, 2000);
 }
 
-function fmt(sec) {
+/* ---------- Результат ---------- */
+
+function clock(sec) {
   const s = Math.floor(sec);
-  return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}.${Math.round((sec - s) * 10)}`;
+  return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+}
+
+function plural(n, one, few, many) {
+  const m10 = n % 10, m100 = n % 100;
+  if (m10 === 1 && m100 !== 11) return one;
+  if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return few;
+  return many;
 }
 
 function seek(sec) {
   const player = $("player");
   player.currentTime = sec;
-  player.scrollIntoView({ behavior: "smooth", block: "center" });
+  player.pause();
+  if (window.matchMedia("(max-width: 760px)").matches) {
+    player.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+}
+
+function zoom(src, caption) {
+  $("zoom-img").src = src;
+  $("zoom-img").alt = caption;
+  $("zoom-cap").textContent = caption;
+  $("zoom").showModal();
 }
 
 function render(job) {
-  const ok = job.verdict === "no_violation";
   const items = job.violations;
+  const found = items.length > 0;
   $("demo").hidden = job.analyzer !== "mock";
-  const verdict = $("verdict");
-  verdict.className = `verdict ${ok ? "ok" : "bad"}`;
-  verdict.textContent = ok
-    ? "Нарушение не обнаружено"
-    : `Обнаружены признаки возможных нарушений: ${items.length}`;
 
+  const verdict = $("verdict");
+  verdict.classList.toggle("clear", !found);
+  $("verdict-title").textContent = found
+    ? "Обнаружены признаки возможных нарушений"
+    : "Нарушение не обнаружено";
+  const count = found ? `${items.length} ${plural(items.length, "событие", "события", "событий")}. ` : "";
+  $("verdict-meta").textContent = `${count}Проверка заняла ${Math.round(job.processing_time_sec)} с.`;
+  verdict.classList.remove("reveal");
+  void verdict.offsetWidth; // перезапуск анимации при повторной проверке
+  verdict.classList.add("reveal");
+
+  // Видео и шкала
   const player = $("player");
-  // preview.mp4 может ещё конвертироваться — тогда пробуем исходный файл.
   player.onerror = () => {
     if (!player.src.endsWith(job.original_url)) player.src = job.original_url;
   };
   player.src = job.video_url;
-
-  const timeline = $("timeline");
-  timeline.replaceChildren();
   const duration = job.duration_sec || 1;
+  $("track-end").textContent = clock(duration);
+  const track = $("track");
+  track.replaceChildren();
+  const head = document.createElement("span");
+  head.className = "head";
+  track.append(head);
+  player.ontimeupdate = () => { head.style.left = `${(player.currentTime / duration) * 100}%`; };
   items.forEach((ev) => {
-    const bar = document.createElement("span");
-    bar.style.left = `calc(${(ev.timecode_sec / duration) * 100}% - 3px)`;
-    bar.title = `${fmt(ev.timecode_sec)} — ${ev.type}`;
-    bar.onclick = () => seek(ev.timecode_sec);
-    timeline.append(bar);
+    const mark = document.createElement("button");
+    mark.type = "button";
+    mark.style.left = `${(ev.timecode_sec / duration) * 100}%`;
+    mark.title = `${clock(ev.timecode_sec)} ${ev.type}`;
+    mark.setAttribute("aria-label", `Перейти к ${clock(ev.timecode_sec)}: ${ev.type}`);
+    mark.onclick = () => seek(ev.timecode_sec);
+    track.append(mark);
   });
 
+  // События
   const list = $("events");
   list.replaceChildren();
   const tpl = $("event-tpl");
-  items.forEach((ev) => {
+  items.forEach((ev, index) => {
     const node = tpl.content.cloneNode(true);
     const tc = node.querySelector(".timecode");
-    tc.textContent = fmt(ev.timecode_sec);
+    const tenths = Math.floor((ev.timecode_sec % 1) * 10);
+    const small = document.createElement("small");
+    small.textContent = `.${tenths}`;
+    tc.replaceChildren(clock(ev.timecode_sec), small);
     tc.onclick = () => seek(ev.timecode_sec);
-    node.querySelector(".type").textContent = ev.type;
-    node.querySelector(".description").textContent = ev.description;
+    node.querySelector(".event-type").textContent = ev.type;
+    node.querySelector(".event-desc").textContent = ev.description;
+
     const frames = node.querySelector(".frames");
-    ev.evidence_frames.forEach((f) => {
+    ev.evidence_frames.forEach((f, i) => {
       const fig = document.createElement("figure");
+      const btn = document.createElement("button");
+      btn.type = "button";
       const img = document.createElement("img");
       img.src = f.url;
-      img.alt = `Кадр ${f.timestamp_sec} с`;
-      img.onclick = () => window.open(f.url, "_blank");
+      const caption = i === 0
+        ? `${f.timestamp_sec.toFixed(1)} с, момент события`
+        : `${f.timestamp_sec.toFixed(1)} с`;
+      img.alt = `Кадр на ${caption}`;
+      btn.append(img);
+      btn.onclick = () => zoom(f.url, `${ev.type}, кадр на ${caption}`);
       const cap = document.createElement("figcaption");
-      cap.textContent = `${f.timestamp_sec.toFixed(1)} с`;
-      fig.append(img, cap);
+      cap.textContent = caption;
+      fig.append(btn, cap);
       frames.append(fig);
     });
-    node.querySelector(".doc").textContent = ev.source.document;
-    node.querySelector(".section").textContent = ev.source.section;
-    const link = node.querySelector(".source");
-    link.href = ev.source.url;
-    link.textContent = ev.source.url;
+
+    node.querySelector(".basis-doc").textContent = `${ev.source.document}, ${ev.source.section}`;
+    node.querySelector(".basis-link").href = ev.source.url;
+
+    const review = node.querySelector(".review");
+    const state = node.querySelector(".review-state");
+    const buttons = review.querySelectorAll("button");
+    const show = (decision) => {
+      buttons.forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.decision === decision)));
+      state.textContent = decision === "confirmed" ? "Отмечено как нарушение"
+        : decision === "rejected" ? "Отмечено как ложное срабатывание" : "";
+    };
+    show((job.feedback || {})[index]);
+    buttons.forEach((b) => {
+      b.onclick = async () => {
+        const res = await fetch(`/web/jobs/${job.job_id}/feedback`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ event_index: index, decision: b.dataset.decision }),
+        });
+        if (res.ok) show(b.dataset.decision);
+        else state.textContent = "Отметка не сохранилась. Попробуйте ещё раз.";
+      };
+    });
     list.append(node);
   });
+
+  $("clean").hidden = found;
+  if (!found) $("checks").open = true;
 
   const blob = new Blob([JSON.stringify(job, null, 2)], { type: "application/json" });
   $("download").href = URL.createObjectURL(blob);
   $("result").hidden = false;
+  $("result").scrollIntoView({ behavior: "smooth", block: "start" });
 }
+
+const linked = new URLSearchParams(location.hash.slice(1)).get("job");
+if (linked) poll(linked);

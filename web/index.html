@@ -3,56 +3,113 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>CashLens AI</title>
+  <title>CashLens — проверка кассы по видео</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <header>
-    <h1>CashLens AI</h1>
-    <p class="muted">Выявление признаков нарушений кассовой дисциплины по видео</p>
+  <header class="top">
+    <div class="top-inner">
+      <a class="wordmark" href="/">CashLens</a>
+      <span class="top-sub">Проверка кассовых операций по видео</span>
+      <span id="mode" class="mode" hidden></span>
+    </div>
   </header>
 
   <main>
-    <section class="card">
+    <section class="intake" aria-labelledby="intake-title">
+      <h1 id="intake-title">Загрузите запись с камеры кассы</h1>
+      <p class="lead">
+        Сервис найдёт моменты, похожие на нарушение кассовой дисциплины, и покажет
+        таймкод, кадры и норму, на которую стоит опереться при проверке.
+      </p>
+
       <form id="upload">
         <label class="drop" id="drop">
-          <input type="file" id="file" accept=".mov,.mp4,video/*" hidden>
-          <span id="drop-text">Перетащите .mov сюда или нажмите, чтобы выбрать</span>
+          <input type="file" id="file" accept=".mov,.mp4,video/*">
+          <span class="drop-title" id="drop-title">Перетащите файл .mov сюда</span>
+          <span class="drop-hint" id="drop-hint">или нажмите, чтобы выбрать на компьютере</span>
         </label>
-        <button type="submit" id="submit" disabled>Анализировать</button>
+        <button type="submit" id="submit" class="primary" disabled>Проверить запись</button>
       </form>
-      <progress id="progress" max="100" value="0" hidden></progress>
-      <p id="status" class="muted"></p>
+
+      <ol class="steps" id="steps" hidden>
+        <li data-step="upload">Загрузка</li>
+        <li data-step="queued">Очередь</li>
+        <li data-step="processing">Анализ</li>
+        <li data-step="done">Готово</li>
+      </ol>
+      <p id="status" class="status" role="status" aria-live="polite"></p>
     </section>
 
-    <section id="result" hidden>
+    <section id="result" class="result" hidden aria-label="Результат проверки">
       <div id="demo" class="demo" hidden>
-        Демо-режим: модель не подключена, результат сгенерирован заглушкой и не отражает содержимое видео.
+        Демо-режим: модель не подключена. Результат сгенерирован заглушкой и не отражает содержимое видео.
       </div>
-      <div id="verdict" class="verdict"></div>
-      <div class="card">
-        <video id="player" controls muted playsinline></video>
-        <div id="timeline" class="timeline"></div>
+
+      <div id="verdict" class="verdict">
+        <p class="verdict-title" id="verdict-title"></p>
+        <p class="verdict-meta" id="verdict-meta"></p>
       </div>
-      <div id="events"></div>
-      <p><a id="download" class="muted" download="result.json">Скачать JSON</a></p>
+
+      <div class="layout">
+        <aside class="viewer">
+          <video id="player" controls muted playsinline preload="metadata"></video>
+          <div class="track" id="track" aria-label="Шкала записи с отметками событий"></div>
+          <div class="track-scale"><span>00:00</span><span id="track-end"></span></div>
+          <a id="download" class="quiet-link" download="cashlens-result.json">Скачать результат в JSON</a>
+        </aside>
+
+        <div class="findings">
+          <div id="events"></div>
+          <div id="clean" class="clean" hidden>
+            <p>В записи не найдено действий, которые подпадают под проверяемые правила.</p>
+            <p class="muted">Ниже — что именно сервис искал в этой записи.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="checks" aria-labelledby="checks-title">
+      <details id="checks">
+        <summary id="checks-title">Что проверяет сервис</summary>
+        <ul id="rules" class="rules"></ul>
+      </details>
     </section>
   </main>
 
+  <footer class="foot">
+    <p>
+      Результат — подсказка для проверяющего, а не заключение. Лица не распознаются,
+      видео и кадры не передаются во внешние сервисы.
+    </p>
+  </footer>
+
   <template id="event-tpl">
-    <article class="card event">
-      <div class="event-head">
-        <button class="timecode" type="button"></button>
-        <h3 class="type"></h3>
-      </div>
-      <p class="description"></p>
+    <article class="event">
+      <header class="event-head">
+        <button class="timecode" type="button" title="Перейти к моменту в видео"></button>
+        <h2 class="event-type"></h2>
+      </header>
+      <p class="event-desc"></p>
       <div class="frames"></div>
-      <div class="rule">
-        <strong>Источник:</strong> <span class="doc"></span>, <span class="section"></span><br>
-        <a class="source" target="_blank" rel="noopener"></a>
+      <div class="basis">
+        <p class="basis-label">Основание</p>
+        <p class="basis-doc"></p>
+        <a class="basis-link" target="_blank" rel="noopener">Открыть текст нормы</a>
+      </div>
+      <div class="review" role="group" aria-label="Оценка проверяющего">
+        <button type="button" class="ghost" data-decision="confirmed">Подтверждаю нарушение</button>
+        <button type="button" class="ghost" data-decision="rejected">Ложное срабатывание</button>
+        <span class="review-state" aria-live="polite"></span>
       </div>
     </article>
   </template>
+
+  <dialog id="zoom" class="zoom">
+    <form method="dialog"><button class="zoom-close" aria-label="Закрыть">Закрыть</button></form>
+    <img id="zoom-img" alt="">
+    <p id="zoom-cap"></p>
+  </dialog>
 
   <script src="/static/app.js"></script>
 </body>

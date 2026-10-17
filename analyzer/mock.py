@@ -14,7 +14,7 @@ from cashlens_ai.video import get_frame_at, probe_video
 
 DEMO_SOURCE = RuleSource(
     document="ДЕМО-РЕЖИМ: модель не подключена, источник не выбран",
-    section="—",
+    section="пункт не выбран",
     url="https://adilet.zan.kz/rus/docs/V1900019680",
 )
 

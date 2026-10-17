@@ -31,6 +31,18 @@ def init() -> None:
                 error TEXT
             )"""
         )
+        # Отметки проверяющего: подтвердил событие или счёл ложным срабатыванием.
+        # Это размеченные примеры для дообучения и подбора порогов.
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS feedback (
+                job_id TEXT NOT NULL,
+                event_index INTEGER NOT NULL,
+                decision TEXT NOT NULL,
+                comment TEXT,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (job_id, event_index)
+            )"""
+        )
         # Задачи, прерванные перезапуском, возвращаем в очередь.
         c.execute("UPDATE jobs SET status='queued', started_at=NULL WHERE status='processing'")
 
@@ -92,3 +104,22 @@ def queue_position(job_id: str) -> int:
             (job_id,),
         ).fetchone()
     return row["n"]
+
+
+def set_feedback(job_id: str, event_index: int, decision: str, comment: str | None) -> None:
+    with _lock, _conn() as c:
+        c.execute(
+            """INSERT INTO feedback (job_id, event_index, decision, comment, created_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT (job_id, event_index) DO UPDATE SET
+                 decision=excluded.decision, comment=excluded.comment, created_at=excluded.created_at""",
+            (job_id, event_index, decision, comment, time.time()),
+        )
+
+
+def get_feedback(job_id: str) -> dict[int, str]:
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT event_index, decision FROM feedback WHERE job_id=?", (job_id,)
+        ).fetchall()
+    return {r["event_index"]: r["decision"] for r in rows}
