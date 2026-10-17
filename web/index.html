@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CashLens AI</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>CashLens AI</h1>
+    <p class="muted">Выявление признаков нарушений кассовой дисциплины по видео</p>
+  </header>
+
+  <main>
+    <section class="card">
+      <form id="upload">
+        <label class="drop" id="drop">
+          <input type="file" id="file" accept=".mov,.mp4,video/*" hidden>
+          <span id="drop-text">Перетащите .mov сюда или нажмите, чтобы выбрать</span>
+        </label>
+        <button type="submit" id="submit" disabled>Анализировать</button>
+      </form>
+      <progress id="progress" max="100" value="0" hidden></progress>
+      <p id="status" class="muted"></p>
+    </section>
+
+    <section id="result" hidden>
+      <div id="verdict" class="verdict"></div>
+      <div class="card">
+        <video id="player" controls muted playsinline></video>
+        <div id="timeline" class="timeline"></div>
+      </div>
+      <div id="events"></div>
+      <p><a id="download" class="muted" download="result.json">Скачать JSON</a></p>
+    </section>
+  </main>
+
+  <template id="event-tpl">
+    <article class="card event">
+      <div class="event-head">
+        <button class="timecode" type="button"></button>
+        <h3 class="type"></h3>
+        <span class="confidence muted"></span>
+      </div>
+      <p class="description"></p>
+      <div class="frames"></div>
+      <div class="rule">
+        <strong>Требование:</strong> <span class="requirement"></span><br>
+        <strong>Источник:</strong> <a class="source" target="_blank" rel="noopener"></a>
+        <span class="unverified" hidden>не проверено</span>
+      </div>
+    </article>
+  </template>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

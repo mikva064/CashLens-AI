@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+data/
+.pytest_cache/
+# Датасет и веса в репозиторий не кладём
+*.mov
+*.mp4
+weights/
