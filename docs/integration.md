@@ -8,22 +8,30 @@ from cashlens_ai.backend import LocalQwenBackend
 from cashlens_ai.integration import to_api_payload
 from cashlens_ai.pipeline import VideoAnalyzer
 from cashlens_ai.rules import load_rules
+from cashlens_ai.observations import load_observations
 
 rules = load_rules("config/rules.json")
 backend = LocalQwenBackend(Path("local/models/qwen3-vl-2b"))
 backend.load()  # до приёма запросов, без сети
-analyzer = VideoAnalyzer(backend, rules)
+observations = load_observations("config/observations.json")
+analyzer = VideoAnalyzer(backend, rules, observations=observations)
 
 def run_job(job_id, uploaded_video_path):
     # job_id создаёт сервер; клиент не должен задавать путь output.
     output = Path("local/runs") / job_id
     result = analyzer.analyze(uploaded_video_path, output)
+    if result.verdict == "requires_review":
+        # Web retains the observations and evidence for human review.
+        return {"job_id": job_id, "status": "failed", "failure_code": "requires_review",
+                "error": "Требуется проверка эпизодов; нормативного вердикта нет"}
     return to_api_payload(result, job_id=job_id, evidence_root=output)
 ```
 
 Вызовы одного GPU worker выполняются последовательно. Ошибки `CashLensError`, чтения файлов или валидации сервер преобразует в `status="failed"`. При сбое нельзя выдавать `no_violation`.
 
-Внутренний результат: `schema_version`, `verdict`, `violations`. В событии: `type`, `timecode_sec`, `description`, `rule_id`, проверенный `source` и 1–3 элемента `evidence_frames` с `timestamp_sec`/`image_path`.
+Внутренний результат: `schema_version`, `verdict`, `violations`, `observations`. В квалифицированном событии: `type`, `timecode_sec`, `description`, `rule_id`, проверенный `source` и 1–3 элемента `evidence_frames` с `timestamp_sec`/`image_path`. Наблюдение содержит `observation_id`, `type`, `timecode_sec`, `description`, `review_reason`, `evidence_frames`; нормативного источника у него нет.
+
+Только наблюдения дают `requires_review`; только пустые оба списка дают `no_violation`. Наличие квалифицированных событий даёт `violation`, включая смешанный результат. Web сохраняет наблюдения, а публичный API показывает только квалифицированные события. `to_api_payload` отвергает `requires_review`, чтобы вызывающий код явно обработал воздержание вместо отрицательного вердикта.
 
 `to_api_payload` возвращает требуемый JSON: `job_id`, `status="done"`, `verdict`, `violations`. Кадры превращаются в JPEG base64 (`image_base64`). Источник добавляется в `description`: отдельного поля источника в опубликованной схеме нет. UI может показать структурированный источник из внутреннего результата.
 

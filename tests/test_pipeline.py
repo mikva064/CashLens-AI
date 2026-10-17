@@ -1,14 +1,17 @@
 """Integration checks with a generated MOV and a deterministic model stand-in."""
 
+from dataclasses import replace
 from fractions import Fraction
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import av
 from PIL import Image
 
+from cashlens_ai import video
 from cashlens_ai.contracts import Rule, RuleSource
 from cashlens_ai.errors import (
     AnalysisTimeoutError,
@@ -48,17 +51,29 @@ def event(timestamp, *, rule_id="synthetic_event"):
     return {"rule_id": rule_id, "timecode_sec": timestamp, "description": "Synthetic visible event"}
 
 
+def proof_event(frames, action_sec=0.8):
+    action = min(frames, key=lambda frame: abs(frame.timestamp_sec - action_sec))
+    return {**event(action.timestamp_sec),
+            "evidence_timestamps_sec": [frames[0].timestamp_sec, action.timestamp_sec,
+                                        frames[-1].timestamp_sec],
+            "cash_context_timestamp_sec": frames[0].timestamp_sec}
+
+
 class RecordingBackend:
     def __init__(self, callback=None):
         self.calls = []
         self.callback = callback or (lambda phase, frames, rules: response())
 
-    def describe(self, frames, rules, *, phase="coarse", timeout_sec=None):
+    def describe(self, frames, rules, *, phase="coarse", timeout_sec=None,
+                 candidate_timecode_sec=None, candidate_timecodes_sec=None, candidate_radius_sec=None):
         self.calls.append({
             "phase": phase,
             "timestamps": [frame.timestamp_sec for frame in frames],
             "rules": rules,
             "timeout_sec": timeout_sec,
+            "candidate_timecode_sec": candidate_timecode_sec if candidate_timecodes_sec is None else candidate_timecodes_sec[0],
+            "candidate_timecodes_sec": candidate_timecodes_sec,
+            "candidate_radius_sec": candidate_radius_sec,
         })
         return self.callback(phase, frames, rules)
 
@@ -134,7 +149,7 @@ class PipelineTests(unittest.TestCase):
                 coarse_calls += 1
                 return response(event(0.6)) if coarse_calls == 1 else response()
             self.assertEqual(phase, "fine")
-            return response(event(0.73))
+            return response(proof_event(frames))
 
         backend = RecordingBackend(detect)
         output = self.root / "job"
@@ -147,9 +162,12 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(violation.source, self.rule.source)
         fine_calls = [call for call in backend.calls if call["phase"] == "fine"]
         self.assertEqual(len(fine_calls), 1)
-        self.assertEqual([round(ts, 6) for ts in fine_calls[0]["timestamps"]], [0.2, 0.4, 0.6, 0.8])
+        self.assertEqual([round(ts, 6) for ts in fine_calls[0]["timestamps"]],
+                         [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2])
         self.assertEqual([rule["id"] for rule in fine_calls[0]["rules"]], [self.rule.id])
-        self.assertEqual([round(frame.timestamp_sec, 6) for frame in violation.evidence_frames], [0.2, 0.8, 1.2])
+        self.assertEqual([round(frame.timestamp_sec, 6) for frame in violation.evidence_frames], [0.0, 0.8, 1.2])
+        self.assertEqual(fine_calls[0]["candidate_timecode_sec"], 0.6)
+        self.assertEqual(fine_calls[0]["candidate_radius_sec"], self.config.refine_radius_sec)
         for frame in violation.evidence_frames:
             self.assertEqual(frame.image_path.parent, output.resolve())
             self.assertTrue(frame.image_path.is_file())
@@ -172,6 +190,72 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result.verdict, "no_violation")
         self.assertEqual(result.violations, [])
         self.assertEqual(len([call for call in backend.calls if call["phase"] == "fine"]), 1)
+
+    def test_fine_retains_coarse_context_for_disconfirmation_under_frame_cap(self):
+        source_context = []
+        coarse_calls = 0
+
+        def detect(phase, frames, rules):
+            nonlocal coarse_calls
+            timestamps = [round(frame.timestamp_sec, 6) for frame in frames]
+            if phase == "coarse":
+                coarse_calls += 1
+                if coarse_calls == 2:
+                    source_context.extend((timestamps[0], timestamps[-1]))
+                    return response(event(1.6))
+                return response()
+            # Preserve the apparent action as well as the original beginning/end
+            # that disprove it. Sparse naive downsampling can lose either.
+            if all(timestamp in timestamps for timestamp in [*source_context, 1.6]):
+                return response()
+            return response(event(1.6))
+
+        config = replace(self.config, refine_radius_sec=0.3,
+                         refine_fps=20, max_refine_frames=4)
+        backend = RecordingBackend(detect)
+        with patch("cashlens_ai.video._sample", wraps=video._sample) as convert:
+            result = VideoAnalyzer(backend, [self.rule], config=config).analyze(
+                self.video, self.root / "job")
+        fine_conversions = [call for call in convert.call_args_list
+                            if call.args[2] == config.refine_max_edge]
+        self.assertLessEqual(len(fine_conversions), config.max_refine_frames)
+        self.assertEqual(result.verdict, "no_violation")
+        self.assertEqual(result.violations, [])
+        fine_calls = [call for call in backend.calls if call["phase"] == "fine"]
+        self.assertEqual(len(fine_calls), 1)
+        self.assertEqual(source_context, [1.0, 2.0])
+        fine_times = [round(ts, 6) for ts in fine_calls[0]["timestamps"]]
+        self.assertEqual(fine_times, [1.0, 1.4, 1.6, 2.0])
+        self.assertEqual(len(fine_times), config.max_refine_frames)
+
+    def test_refine_cap_must_allow_both_context_edges_and_candidate(self):
+        with self.assertRaisesRegex(ValueError, "max_refine_frames >= 3"):
+            replace(self.config, max_refine_frames=2)
+
+    def test_same_rule_candidates_from_one_context_share_one_fine_call(self):
+        coarse_calls = 0
+
+        def detect(phase, frames, rules):
+            nonlocal coarse_calls
+            if phase == "coarse":
+                coarse_calls += 1
+                return (response(event(0.6), event(0.8), event(1.0))
+                        if coarse_calls == 1 else response())
+            return response(proof_event(frames))
+
+        # Keep the three coarse anchors separate so only context deduplication
+        # can prevent repeated fine inference on their identical rule/window.
+        config = replace(self.config, merge_sec=0.05)
+        backend = RecordingBackend(detect)
+        result = VideoAnalyzer(backend, [self.rule], config=config).analyze(
+            self.video, self.root / "job")
+        fine_calls = [call for call in backend.calls if call["phase"] == "fine"]
+        self.assertEqual(len(fine_calls), 1)
+        self.assertEqual(result.verdict, "violation")
+        self.assertEqual(len(result.violations), 1)
+        self.assertEqual(result.violations[0].rule_id, self.rule.id)
+        self.assertAlmostEqual(result.violations[0].timecode_sec, 0.8, places=6)
+        self.assertEqual(result.violations[0].source, self.rule.source)
 
     def test_unknown_rule_out_of_range_or_malformed_output_fails(self):
         bad_outputs = (

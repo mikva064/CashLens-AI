@@ -25,6 +25,10 @@ class MockAnalyzer:
     def load(self) -> None:
         pass
 
+    def capabilities(self) -> dict:
+        return {"model_name": None, "rule_count": 0, "rules": [],
+                "limitations": "Демонстрационный режим: видео не проверяется моделью."}
+
     def analyze(self, video: Path, output_dir: Path, deadline_sec: float) -> AnalysisResult:
         time.sleep(float(os.getenv("CASHLENS_MOCK_DELAY", "2")))
         output_dir.mkdir(parents=True, exist_ok=False)

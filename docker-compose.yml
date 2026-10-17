@@ -1,0 +1,67 @@
+name: cashlens
+
+services:
+  cashlens:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cashlens-ai:local
+    platform: linux/amd64
+    init: true
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:${CASHLENS_PORT:-8000}:8000"
+    environment:
+      CASHLENS_API_KEY: ${CASHLENS_API_KEY:?Set CASHLENS_API_KEY in your local .env}
+      CASHLENS_ANALYZER: model
+      CASHLENS_MODEL_DIR: /models/qwen3-vl-2b
+      CASHLENS_RULES: /app/config/rules.json
+      CASHLENS_DATA_DIR: /data
+      CASHLENS_WEB_UPLOAD: "1"
+      CASHLENS_MAX_OUTSTANDING_JOBS: ${CASHLENS_MAX_OUTSTANDING_JOBS:-1}
+      CASHLENS_JOB_TIMEOUT: ${CASHLENS_JOB_TIMEOUT:-270}
+      CASHLENS_MODEL_LOAD_TIMEOUT: ${CASHLENS_MODEL_LOAD_TIMEOUT:-180}
+      CASHLENS_QUANTIZE_4BIT: "1"
+      CASHLENS_PERFORMANCE_PROFILE: ${CASHLENS_PERFORMANCE_PROFILE:-balanced}
+      CASHLENS_GPU_DUTY_CYCLE: ${CASHLENS_GPU_DUTY_CYCLE:-0.75}
+      CASHLENS_GPU_MEMORY_FRACTION: ${CASHLENS_GPU_MEMORY_FRACTION:-0.80}
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      TOKENIZERS_PARALLELISM: "false"
+    volumes:
+      - type: bind
+        source: ./local/models
+        target: /models
+        read_only: true
+        bind:
+          create_host_path: false
+      - cashlens-data:/data
+    networks:
+      - offline
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json,sys,urllib.request; h=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=3)); sys.exit(0 if h.get('analyzer')=='model' and h.get('analyzer_ready') is True else 1)"
+      interval: 20s
+      timeout: 5s
+      start_period: 180s
+      retries: 3
+
+networks:
+  offline:
+    driver: bridge
+    internal: true
+
+volumes:
+  cashlens-data:

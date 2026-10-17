@@ -19,18 +19,26 @@
     <section class="intake" aria-labelledby="intake-title">
       <h1 id="intake-title">Загрузите запись с камеры кассы</h1>
       <p class="lead">
-        Сервис найдёт моменты, похожие на нарушение кассовой дисциплины, и покажет
-        таймкод, кадры и норму, на которую стоит опереться при проверке.
+        Сервис покажет наблюдаемые эпизоды с таймкодами, кадрами и контекстом.
+        Признаки по подключённым нормативным правилам выделяются отдельно.
       </p>
+
+      <div class="model-panel">
+        <p id="model-status" class="model-status loading" role="status">Проверяем готовность модели…</p>
+        <p id="model-name" class="muted"></p>
+        <p id="performance" class="muted" hidden></p>
+        <p id="performance-note" class="muted" hidden></p>
+      </div>
 
       <form id="upload">
         <label class="drop" id="drop">
-          <input type="file" id="file" accept=".mov,.mp4,video/*">
+          <input type="file" id="file" accept=".mov,.mp4,video/*" disabled>
           <span class="drop-title" id="drop-title">Перетащите файл .mov сюда</span>
           <span class="drop-hint" id="drop-hint">или нажмите, чтобы выбрать на компьютере</span>
         </label>
         <button type="submit" id="submit" class="primary" disabled>Проверить запись</button>
       </form>
+      <progress id="progress" max="100" value="0" hidden></progress>
 
       <ol class="steps" id="steps" hidden>
         <li data-step="upload">Загрузка</li>
@@ -48,6 +56,8 @@
           <dt>Файл</dt><dd id="r-file"></dd>
           <dt>Проверено</dt><dd id="r-date"></dd>
           <dt>Номер проверки</dt><dd id="r-id"></dd>
+          <dt>SHA-256 видео</dt><dd id="r-input-sha256" class="report-hash"></dd>
+          <dt>SHA-256 JSON</dt><dd id="r-result-sha256" class="report-hash"></dd>
         </dl>
       </div>
       <div id="demo" class="demo" hidden>
@@ -58,20 +68,34 @@
         <p class="verdict-title" id="verdict-title"></p>
         <p class="verdict-meta" id="verdict-meta"></p>
       </div>
+      <p id="result-model" class="muted"></p>
 
       <div class="layout">
         <aside class="viewer">
           <video id="player" controls muted playsinline preload="metadata"></video>
           <div class="track" id="track" aria-label="Шкала записи с отметками событий"></div>
           <div class="track-scale"><span>00:00</span><span id="track-end"></span></div>
+          <div id="track-legend" class="track-legend" hidden>
+            <span id="track-qualified" class="qualified">По нормативным правилам</span>
+            <span class="observation">Требует проверки</span>
+          </div>
           <div class="viewer-actions">
             <button type="button" id="print" class="ghost">Распечатать отчёт</button>
             <a id="download" class="quiet-link" download="cashlens-result.json">Скачать JSON</a>
           </div>
+          <p id="download-note" class="muted download-note"></p>
         </aside>
 
         <div class="findings">
-          <div id="events"></div>
+          <section id="qualified-section" aria-labelledby="qualified-title">
+            <h2 id="qualified-title" class="findings-title">Признаки по нормативным правилам</h2>
+            <div id="events"></div>
+          </section>
+          <section id="observations-section" hidden aria-labelledby="observations-title">
+            <h2 id="observations-title" class="findings-title">Наблюдаемые эпизоды — требуется проверка</h2>
+            <p class="muted observation-explanation">Эпизоды требуют оценки человеком. Автоматическая нормативная квалификация для них отсутствует.</p>
+            <div id="observations"></div>
+          </section>
           <div class="print-sign">
             <p>Решение проверяющего: ______________________________</p>
             <p>Проверяющий: ____________________ (ФИО, подпись)    Дата: ____________</p>
@@ -89,7 +113,18 @@
     <section class="checks" aria-labelledby="checks-title">
       <details id="checks">
         <summary id="checks-title">Что проверяет сервис</summary>
+        <p id="limitations" class="muted">Сервис ищет видимые признаки по подключённым правилам. Результат требует проверки специалистом и не является окончательным юридическим заключением.</p>
+        <h3 class="coverage-heading">Нормативные правила</h3>
         <ul id="rules" class="rules"></ul>
+        <h3 class="coverage-heading">Наблюдаемые эпизоды</h3>
+        <p class="muted coverage-note">Видимые действия, для которых нужны оценка контекста и проверка человеком. Наличие эпизода само по себе не устанавливает нарушение нормы.</p>
+        <ul id="observation-types" class="rules"></ul>
+        <div class="feedback-stats" aria-labelledby="stats-title">
+          <h3 id="stats-title">Отметки проверяющих</h3>
+          <p id="stats-status" class="muted" role="status">Загружаем отметки…</p>
+          <ul id="stats-rules" class="rules"></ul>
+          <p class="muted">Это оценки срабатываний по нормативным правилам, а не измеренная точность модели. Наблюдаемые эпизоды и проверки без срабатываний здесь не учитываются.</p>
+        </div>
       </details>
     </section>
   </main>
@@ -108,7 +143,15 @@
         <h2 class="event-type"></h2>
       </header>
       <p class="event-desc"></p>
+      <div class="observation-review" hidden>
+        <span class="review-badge">Требует проверки</span>
+        <p class="review-reason"></p>
+      </div>
       <div class="frames"></div>
+      <div class="event-clip" hidden>
+        <p class="event-clip-title">Мини-клип с контекстом события</p>
+        <video class="clip-player" controls muted playsinline preload="metadata"></video>
+      </div>
       <div class="basis">
         <p class="basis-label">Основание</p>
         <p class="basis-doc"></p>
