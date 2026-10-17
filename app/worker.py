@@ -20,7 +20,8 @@ log = logging.getLogger("cashlens.worker")
 
 # Состояние анализатора для /health и интерфейса.
 state = {"analyzer": None, "ready": False, "error": None, "status": "stopped",
-         "model_name": None, "rule_count": 0, "rules": [], "limitations": ""}
+         "model_name": None, "rule_count": 0, "rules": [], "limitations": "",
+         "performance": {}}
 _state_lock = threading.Lock()
 _thread: threading.Thread | None = None
 
@@ -127,7 +128,7 @@ def start() -> threading.Event:
         raise RuntimeError("The previous analyzer worker is still running")
     _update(analyzer=os.getenv("CASHLENS_ANALYZER", "model").strip().lower(),
             ready=False, error=None, status="loading", model_name=None,
-            rule_count=0, rules=[], limitations="")
+            rule_count=0, rules=[], limitations="", performance={})
     stop = threading.Event()
     _thread = threading.Thread(target=_loop, args=(stop,), name="cashlens-worker", daemon=True)
     _thread.start()

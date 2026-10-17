@@ -15,7 +15,8 @@ from unittest.mock import MagicMock, patch
 
 from cashlens_ai.backend import (COARSE_DESCRIPTION, DESCRIPTION_MAX_CHARS, MAX_WINDOW_EVENTS,
                                  LocalQwenBackend, _StopAfterJsonObject, _build_output_schema,
-                                 _build_prompt, _expand_wire_response, _has_complete_json_object)
+                                 _GpuDutyPacer, _build_prompt, _expand_wire_response,
+                                 _has_complete_json_object)
 from cashlens_ai.errors import InvalidModelOutputError, ModelUnavailableError, RuleValidationError
 
 
@@ -51,6 +52,11 @@ class BackendTests(unittest.TestCase):
             is_available=lambda: cuda,
             is_bf16_supported=lambda: bf16,
             empty_cache=MagicMock(),
+            set_per_process_memory_fraction=MagicMock(),
+            synchronize=MagicMock(),
+            memory_allocated=lambda _: 1024 * 1024 * 123,
+            memory_reserved=lambda _: 1024 * 1024 * 456,
+            max_memory_allocated=lambda _: 1024 * 1024 * 789,
         )
         torch.inference_mode = contextlib.nullcontext
         transformers = types.ModuleType("transformers")
@@ -129,8 +135,10 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(model.generate.call_args.kwargs["max_time"], 7.5)
         self.assertFalse(model.generate.call_args.kwargs["do_sample"])
         stopping = model.generate.call_args.kwargs["stopping_criteria"]
-        self.assertEqual(len(stopping), 1)
+        self.assertEqual(len(stopping), 2)
         self.assertIsInstance(stopping[0], _StopAfterJsonObject)
+        self.assertIsInstance(stopping[1], _GpuDutyPacer)
+        self.assertEqual(stopping[1].duty_cycle, 0.75)
         self.assertEqual(stopping[0].prompt_length, 99)
         self.assertEqual(stopping[0].max_new_tokens, self.backend.max_new_tokens)
         self.assertIs(
@@ -204,7 +212,7 @@ class BackendTests(unittest.TestCase):
         self.assertIsNone(self.backend._processor)
         self.assertIsNone(self.backend._tokenizer_data)
         transformers._lmfe_integration.build_token_enforcer_tokenizer_data.assert_called_once()
-        torch.cuda.empty_cache.assert_called_once()
+        self.assertEqual(torch.cuda.empty_cache.call_count, 4)  # load, 2 windows, close
 
     def test_enforcer_is_required_without_unconstrained_fallback(self):
         torch, transformers, model, *_ = self.fake_dependencies()
@@ -246,6 +254,9 @@ class BackendTests(unittest.TestCase):
         self.assertIn("latency_sec=", diagnostic)
         self.assertNotIn("PRIVATE OUTPUT", diagnostic)
         self.assertNotIn(self.directory.name, diagnostic)
+        self.assertIn("'allocated_mib': 123", diagnostic)
+        self.assertIn("'reserved_mib': 456", diagnostic)
+        self.assertIn("'peak_allocated_mib': 789", diagnostic)
 
     def test_prompts_use_bounded_phase_specific_descriptions(self):
         coarse = _build_prompt(RULES, "coarse")
@@ -257,6 +268,90 @@ class BackendTests(unittest.TestCase):
         self.assertIn("at most 12 words and 96 characters", fine)
         self.assertNotIn(COARSE_DESCRIPTION, fine)
         self.assertIn('{"e":[{"f":0,"d":"visible evidence"}]}', fine)
+
+    def test_memory_limit_is_applied_after_loaded_weights_and_cache_release(self):
+        torch, transformers, model, *_ = self.fake_dependencies()
+        events = []
+        model.eval.side_effect = lambda: events.append("weights_loaded") or model
+        torch.cuda.empty_cache.side_effect = lambda: events.append("cache_released")
+        torch.cuda.set_per_process_memory_fraction.side_effect = lambda *args, **kwargs: events.append("limit_set")
+        with patch.dict(sys.modules, self.dependency_modules(torch, transformers)), patch.dict(os.environ):
+            self.backend.load()
+        self.assertEqual(events, ["weights_loaded", "cache_released", "limit_set"])
+        torch.cuda.set_per_process_memory_fraction.assert_called_once_with(0.8, device=0)
+
+    def test_memory_limit_can_be_disabled_explicitly(self):
+        self.backend = LocalQwenBackend(Path(self.directory.name), gpu_memory_fraction=None, gpu_duty_cycle=1)
+        torch, transformers, *_ = self.fake_dependencies()
+        with patch.dict(sys.modules, self.dependency_modules(torch, transformers)), patch.dict(os.environ):
+            self.backend.load()
+        torch.cuda.set_per_process_memory_fraction.assert_not_called()
+
+    def test_releasing_unused_cache_keeps_loaded_weights(self):
+        torch, transformers, model, *_ = self.fake_dependencies()
+        with patch.dict(sys.modules, self.dependency_modules(torch, transformers)), patch.dict(os.environ):
+            self.backend.load()
+            count = torch.cuda.empty_cache.call_count
+            self.backend.release_unused_memory()
+        self.assertIs(self.backend._model, model)
+        self.assertEqual(torch.cuda.empty_cache.call_count, count + 1)
+
+    def test_inference_failure_releases_window_cache(self):
+        torch, transformers, model, *_ = self.fake_dependencies()
+        model.generate.side_effect = RuntimeError("synthetic inference failure")
+        with patch.dict(sys.modules, self.dependency_modules(torch, transformers)), patch.dict(os.environ):
+            with self.assertRaises(ModelUnavailableError):
+                self.backend.describe(self.frames, RULES)
+        self.assertEqual(torch.cuda.empty_cache.call_count, 2)  # load and failed window
+
+    def test_invalid_resource_controls_are_rejected_before_loading(self):
+        for name in ("gpu_duty_cycle", "gpu_memory_fraction"):
+            for value in (0.0, 0.09, 1.01, float("nan"), float("inf"), True):
+                with self.subTest(name=name, value=value), self.assertRaises(ValueError):
+                    LocalQwenBackend(Path(self.directory.name), **{name: value})
+
+
+class GpuPacingTests(unittest.TestCase):
+    @staticmethod
+    def fake_clock():
+        timer = SimpleNamespace(value=0.0, pauses=[])
+
+        def sleep(seconds):
+            timer.pauses.append(seconds)
+            timer.value += seconds
+
+        return timer, lambda: timer.value, sleep
+
+    def test_completed_steps_receive_proportional_idle_time_and_never_stop(self):
+        timer, clock, sleep = self.fake_clock()
+        cuda = SimpleNamespace(synchronize=MagicMock())
+        pacer = _GpuDutyPacer(cuda, 0.75, clock=clock, sleep=sleep)
+        for work in (0.3, 0.6, 0.15):
+            timer.value += work
+            self.assertFalse(pacer(None, None))
+        self.assertAlmostEqual(pacer.total_sleep_sec, 0.35)
+        self.assertAlmostEqual(1.05 / timer.value, 0.75)
+        self.assertEqual(cuda.synchronize.call_count, 3)
+
+    def test_long_prefill_idle_debt_is_repaid_in_bounded_pauses(self):
+        timer, clock, sleep = self.fake_clock()
+        pacer = _GpuDutyPacer(SimpleNamespace(synchronize=MagicMock()), 0.5,
+                             clock=clock, sleep=sleep)
+        timer.value = 10
+        for _ in range(10):
+            self.assertFalse(pacer(None, None))
+        self.assertTrue(all(0 < pause <= 1 for pause in timer.pauses))
+        self.assertAlmostEqual(pacer.total_sleep_sec, 10)
+        self.assertAlmostEqual(10 / timer.value, 0.5)
+
+    def test_full_duty_performs_no_sleep_or_extra_cuda_sync(self):
+        timer, clock, sleep = self.fake_clock()
+        cuda = SimpleNamespace(synchronize=MagicMock())
+        pacer = _GpuDutyPacer(cuda, 1, clock=clock, sleep=sleep)
+        timer.value = 20
+        self.assertFalse(pacer(None, None))
+        self.assertEqual(timer.pauses, [])
+        cuda.synchronize.assert_not_called()
 
 
 class CompactWireTests(unittest.TestCase):

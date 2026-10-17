@@ -48,7 +48,9 @@ class StubModel:
     def capabilities(self):
         return {"model_name": "Synthetic model stub", "rule_count": 1,
                 "rules": [RULE.model_dump(mode="json", exclude={"verified"})],
-                "limitations": "Test capability information"}
+                "limitations": "Test capability information",
+                "performance": {"profile": "balanced", "gpu_duty_cycle": 0.75,
+                                "gpu_memory_fraction": 0.80}}
 
     def analyze(self, video, output_dir, deadline_sec):
         assert Path(video).exists()
@@ -147,6 +149,8 @@ def test_ready_model_health_and_successful_job(service):
         assert health["rules"][0]["source"]["url"] == RULE.source.url
         assert health["model_name"] == "Synthetic model stub"
         assert isinstance(health["limitations"], str)
+        assert health["performance"] == {"profile": "balanced", "gpu_duty_cycle": 0.75,
+                                         "gpu_memory_fraction": 0.80}
         accepted = upload(client)
         assert accepted.status_code == 200
         result = wait_job(client, accepted.json()["job_id"])
@@ -247,6 +251,89 @@ def test_qwen_uses_root_relative_paths_and_offline_backend(monkeypatch, tmp_path
     assert analyzer.capabilities()["rule_count"] == 1
     analyzer.close()
     backend.close.assert_called_once()
+
+
+@pytest.mark.parametrize("profile,expected", [
+    (None, ("balanced", 384, 640, 131072, 8)),
+    ("quality", ("quality", 448, 896, 262144, 12)),
+])
+def test_qwen_effective_performance_profiles(monkeypatch, profile, expected):
+    import analyzer.qwen as module
+
+    for key in ("CASHLENS_PERFORMANCE_PROFILE", "CASHLENS_MAX_EDGE", "CASHLENS_REFINE_MAX_EDGE",
+                "CASHLENS_MAX_PIXELS", "CASHLENS_MAX_REFINE_FRAMES", "CASHLENS_GPU_DUTY_CYCLE",
+                "CASHLENS_GPU_MEMORY_FRACTION", "CASHLENS_SAMPLE_FPS", "CASHLENS_WINDOW_SEC",
+                "CASHLENS_OVERLAP_SEC"):
+        monkeypatch.delenv(key, raising=False)
+    if profile is not None:
+        monkeypatch.setenv("CASHLENS_PERFORMANCE_PROFILE", profile)
+    backend = MagicMock()
+    constructor = MagicMock(return_value=backend)
+    monkeypatch.setattr(module, "LocalQwenBackend", constructor)
+    monkeypatch.setattr(module, "load_rules", lambda _: [RULE])
+    analyzer = QwenAnalyzer()
+    analyzer.load()
+    info = analyzer.capabilities()["performance"]
+    assert tuple(info[key] for key in ("profile", "max_edge", "refine_max_edge", "max_pixels",
+                                       "max_refine_frames")) == expected
+    assert info["sample_fps"] == 1.0
+    assert (info["window_sec"], info["overlap_sec"]) == (24.0, 4.0)
+    assert info["gpu_duty_cycle"] == constructor.call_args.kwargs["gpu_duty_cycle"] == 0.75
+    assert info["gpu_memory_fraction"] == constructor.call_args.kwargs["gpu_memory_fraction"] == 0.80
+    assert info["max_pixels"] == constructor.call_args.kwargs["max_pixels"]
+
+
+def test_qwen_explicit_settings_override_performance_profile(monkeypatch):
+    import analyzer.qwen as module
+
+    for key, value in {"CASHLENS_PERFORMANCE_PROFILE": "quality", "CASHLENS_MAX_EDGE": "512",
+                       "CASHLENS_REFINE_MAX_EDGE": "768", "CASHLENS_MAX_PIXELS": "196608",
+                       "CASHLENS_MAX_REFINE_FRAMES": "6", "CASHLENS_GPU_DUTY_CYCLE": "0.6",
+                       "CASHLENS_GPU_MEMORY_FRACTION": "0.7", "CASHLENS_SAMPLE_FPS": "0.5"}.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(module, "LocalQwenBackend", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(module, "load_rules", lambda _: [RULE])
+    analyzer = QwenAnalyzer()
+    analyzer.load()
+    info = analyzer.capabilities()["performance"]
+    assert (info["max_edge"], info["refine_max_edge"], info["max_pixels"],
+            info["max_refine_frames"], info["sample_fps"]) == (512, 768, 196608, 6, 0.5)
+    assert (info["gpu_duty_cycle"], info["gpu_memory_fraction"]) == (0.6, 0.7)
+
+
+def test_unknown_performance_profile_blocks_weight_loading(monkeypatch):
+    import analyzer.qwen as module
+
+    monkeypatch.setenv("CASHLENS_PERFORMANCE_PROFILE", "unknown")
+    constructor = MagicMock()
+    monkeypatch.setattr(module, "LocalQwenBackend", constructor)
+    with pytest.raises(ValueError, match="balanced or quality"):
+        QwenAnalyzer().load()
+    constructor.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", [None, "inference", "budget"])
+def test_adapter_releases_unused_memory_and_preserves_loaded_backend(failure):
+    adapter = QwenAnalyzer()
+    backend = MagicMock()
+    adapter._backend = backend
+    config = AnalyzerConfig()
+    result = AnalysisResult(verdict="no_violation", violations=[])
+    analyze = MagicMock(return_value=result)
+    adapter._analyzer = SimpleNamespace(config=config, analyze=analyze)
+    if failure == "inference":
+        analyze.side_effect = AnalysisTimeoutError("synthetic timeout")
+    if failure is None:
+        assert adapter.analyze(Path("synthetic.mov"), Path("out"), 80) is result
+    else:
+        with pytest.raises(AnalysisTimeoutError):
+            adapter.analyze(Path("synthetic.mov"), Path("out"), 10 if failure == "budget" else 80)
+    assert adapter._analyzer.config is config
+    assert adapter._backend is backend
+    backend.release_unused_memory.assert_called_once_with()
+    backend.close.assert_not_called()
+    if failure == "budget":
+        analyze.assert_not_called()
 
 
 def test_invalid_rules_block_loading_weights(monkeypatch):

@@ -94,6 +94,30 @@ def _decode_frames(container, stream, origin: float | None = None):
         yield frame, max(0.0, raw - origin)
 
 
+def _decode_from(path: str | Path, start: float):
+    """Seek before start when stream origin is known; never renormalize a seek."""
+    with _open_video(path) as (source, container, stream):
+        origin = _stream_origin(stream)
+        if start <= 0 or origin is None or stream.time_base is None:
+            yield from _decode_frames(container, stream)
+            return
+        try:
+            offset = int((origin + start) / float(stream.time_base))
+            container.seek(offset, stream=stream, backward=True, any_frame=False)
+            frames = _decode_frames(container, stream, origin)
+            first = next(frames, None)
+        except (av.error.FFmpegError, OSError, EOFError, ValueError, OverflowError):
+            first = None
+        if first is not None and first[1] <= start + 1e-9:
+            yield first
+            yield from frames
+            return
+    # Empty or forward-landing seeks cannot establish the requested prefix.
+    # Reopen sequentially, as get_frame_at does for unreliable containers.
+    with _open_video(path) as (source, container, stream):
+        yield from _decode_frames(container, stream)
+
+
 def _sample(frame, timestamp: float, max_edge: int | None) -> SampledFrame:
     image = frame.to_image().convert("RGB")
     if max_edge is not None and max(image.size) > max_edge:
@@ -162,28 +186,62 @@ def iter_sampled_frames(
     if end is not None and end <= start:
         raise ValueError("end_sec must be greater than start_sec")
 
-    with _open_video(path) as (source, container, stream):
-        decoded_any = False
-        next_target = start
-        for frame, timestamp in _decode_frames(container, stream):
-            decoded_any = True
-            if end is not None and timestamp + 1e-9 >= end:
-                break
-            if timestamp + 1e-9 < next_target:
-                continue
-            yield _sample(frame, timestamp, max_edge)
-            # Advance past every target covered by this frame, without
-            # emitting duplicate images for a low-frame-rate source.
-            covered_targets = (timestamp - start) * rate
-            if math.isfinite(covered_targets):
-                next_index = math.floor(covered_targets + 1e-9) + 1
-                next_target = start + next_index / rate
-            else:
-                # A finite but extremely large sampling rate may overflow
-                # the multiplication; all subsequent frames still qualify.
-                next_target = timestamp
-        if not decoded_any:
-            raise VideoReadError(f"Video contains no decodable frames: {source}")
+    decoded_any = False
+    next_target = start
+    for frame, timestamp in _decode_from(path, start):
+        decoded_any = True
+        if end is not None and timestamp + 1e-9 >= end:
+            break
+        if timestamp + 1e-9 < next_target:
+            continue
+        yield _sample(frame, timestamp, max_edge)
+        # Advance past every target covered by this frame, without
+        # emitting duplicate images for a low-frame-rate source.
+        covered_targets = (timestamp - start) * rate
+        if math.isfinite(covered_targets):
+            next_index = math.floor(covered_targets + 1e-9) + 1
+            next_target = start + next_index / rate
+        else:
+            # A finite but extremely large sampling rate may overflow
+            # the multiplication; all subsequent frames still qualify.
+            next_target = timestamp
+    if not decoded_any:
+        raise VideoReadError(f"Video contains no decodable frames: {Path(path)}")
+
+
+def get_frames_at(
+    path: str | Path, timestamps_sec: list[float], *, max_edge: int | None = None
+) -> list[SampledFrame]:
+    """Read nearest source frames in one range decode, converting only targets.
+
+    Duplicate source frames are returned once, sorted by global video time.
+    Only the previous/current decoded frames and selected RGB images are held.
+    """
+    targets = sorted({_validate_number(value, "timestamp_sec") for value in timestamps_sec})
+    _validate_max_edge(max_edge)
+    if not targets:
+        return []
+    selected: dict[float, SampledFrame] = {}
+    target_index = 0
+    previous = None
+    for current in _decode_from(path, targets[0]):
+        while target_index < len(targets) and current[1] >= targets[target_index]:
+            target = targets[target_index]
+            nearest = current
+            if previous is not None and target - previous[1] <= current[1] - target + 1e-9:
+                nearest = previous
+            if nearest[1] not in selected:
+                selected[nearest[1]] = _sample(nearest[0], nearest[1], max_edge)
+            target_index += 1
+        if target_index == len(targets):
+            break
+        previous = current
+    else:
+        if previous is None:
+            raise VideoReadError(f"Video contains no decodable frames: {Path(path)}")
+        if previous[1] not in selected:
+            selected[previous[1]] = _sample(previous[0], previous[1], max_edge)
+    return sorted(selected.values(), key=lambda frame: frame.timestamp_sec)
 
 
 def _nearest(frames, target: float):

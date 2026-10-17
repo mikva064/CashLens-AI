@@ -130,6 +130,24 @@ function renderCoverage(health) {
   });
 }
 
+function renderPerformance(health) {
+  const info = health.performance;
+  const visible = health.analyzer === "model" && info && typeof info.profile === "string";
+  $("performance").hidden = !visible;
+  $("performance-note").hidden = !visible;
+  if (!visible) return;
+  const profile = info.profile === "balanced" ? "сбалансированный" : "детальные кадры";
+  const duty = Math.round(Number(info.gpu_duty_cycle) * 100);
+  const memory = Math.round(Number(info.gpu_memory_fraction) * 100);
+  $("performance").textContent = `Профиль: ${profile} · целевая доля работы GPU: ${duty}% · лимит памяти PyTorch: ${memory}%`;
+  $("performance-note").textContent = (duty < 100
+    ? "Между вычислениями есть паузы; краткие пики GPU до 100% возможны. "
+    : "Дополнительные паузы GPU отключены; загрузка может достигать 100%. ")
+    + (info.profile === "balanced"
+      ? `Уменьшенные кадры и выборка до ${info.max_refine_frames} кадров на уточнение могут пропустить мелкие объекты и короткие действия.`
+      : "Более крупные кадры требуют больше памяти и времени; качество распознавания всё равно требует проверки.");
+}
+
 async function refreshHealth() {
   try {
     const health = await getJson("/health");
@@ -153,6 +171,7 @@ async function refreshHealth() {
       banner.textContent = "Подготавливаем локальную модель… После загрузки станет доступен выбор видео.";
     }
     $("model-name").textContent = health.model_name ? `Модель: ${health.model_name}` : "";
+    renderPerformance(health);
     renderCoverage(health);
   } catch {
     ready = false;

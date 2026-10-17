@@ -11,7 +11,7 @@ from PIL import Image
 
 from cashlens_ai.errors import VideoReadError
 from cashlens_ai import video
-from cashlens_ai.video import get_frame_at, iter_sampled_frames, probe_video
+from cashlens_ai.video import get_frame_at, get_frames_at, iter_sampled_frames, probe_video
 
 
 def make_mov(path: Path, timestamps=(20, 22, 25, 29)) -> None:
@@ -70,6 +70,40 @@ class VideoTests(unittest.TestCase):
         frames = list(iter_sampled_frames(self.path, fps=10, start_sec=0.1, end_sec=0.9))
         self.assertEqual([round(frame.timestamp_sec, 4) for frame in frames], [0.2, 0.5])
         self.assertEqual(list(iter_sampled_frames(self.path, start_sec=10)), [])
+
+    def test_range_seek_keeps_original_stream_origin(self):
+        with patch("cashlens_ai.video._decode_frames", wraps=video._decode_frames) as decode:
+            frames = list(iter_sampled_frames(self.path, fps=10, start_sec=0.5, end_sec=1.0))
+        self.assertEqual([round(frame.timestamp_sec, 6) for frame in frames], [0.5, 0.9])
+        self.assertEqual(decode.call_args.args[2], 2.0)
+
+    def test_range_seek_falls_back_when_landing_after_requested_start(self):
+        real_decode = video._decode_frames
+        attempts = 0
+
+        def forward_once(container, stream, origin=None):
+            nonlocal attempts
+            attempts += 1
+            frames = real_decode(container, stream, origin)
+            return (item for item in frames if item[1] >= 0.5) if attempts == 1 else frames
+
+        with patch("cashlens_ai.video._decode_frames", side_effect=forward_once):
+            frames = list(iter_sampled_frames(self.path, fps=10, start_sec=0.1, end_sec=0.9))
+        self.assertEqual(attempts, 2)
+        self.assertEqual([round(frame.timestamp_sec, 6) for frame in frames], [0.2, 0.5])
+
+    def test_range_without_origin_metadata_uses_sequential_timestamps(self):
+        with patch("cashlens_ai.video._stream_origin", return_value=None):
+            frames = list(iter_sampled_frames(self.path, fps=10, start_sec=0.1, end_sec=0.9))
+        self.assertEqual([round(frame.timestamp_sec, 6) for frame in frames], [0.2, 0.5])
+
+    def test_batch_nearest_materializes_only_unique_selected_source_frames(self):
+        with patch("cashlens_ai.video._sample", wraps=video._sample) as convert:
+            frames = get_frames_at(self.path, [0.9, 0.18, 0.35, 0.5, 0.5], max_edge=20)
+        self.assertEqual([round(frame.timestamp_sec, 6) for frame in frames], [0.2, 0.5, 0.9])
+        self.assertEqual(convert.call_count, 3)
+        self.assertTrue(all(frame.image.size == (20, 10) for frame in frames))
+        self.assertAlmostEqual(get_frames_at(self.path, [100])[0].timestamp_sec, 0.9)
 
     def test_nearest_frame_and_video_bounds(self):
         for target, expected in ((0.0, 0.0), (0.18, 0.2), (0.35, 0.2), (0.37, 0.5), (100.0, 0.9), (1e308, 0.9)):

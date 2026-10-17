@@ -14,7 +14,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from .errors import InvalidModelOutputError, ModelUnavailableError, RuleValidationError
 
@@ -145,6 +145,46 @@ class _StopAfterJsonObject:
                 and _has_complete_json_object(answers[0]))
 
 
+class _GpuDutyPacer:
+    """Yield between completed token steps; this is no instantaneous GPU cap.
+
+    The first forward pass cannot be interrupted. Its idle-time debt is repaid
+    over later callbacks, at most one second at a time. Wall-clock work includes
+    Python/token filtering overhead, so the target is approximate work pacing.
+    """
+
+    def __init__(self, cuda: Any, duty_cycle: float, *,
+                 clock: Callable[[], float] = time.monotonic,
+                 sleep: Callable[[float], None] = time.sleep,
+                 max_pause_sec: float = 1.0) -> None:
+        if (isinstance(duty_cycle, bool) or not math.isfinite(duty_cycle)
+                or not 0.1 <= duty_cycle <= 1):
+            raise ValueError("gpu_duty_cycle must be finite and between 0.1 and 1")
+        if not math.isfinite(max_pause_sec) or max_pause_sec <= 0:
+            raise ValueError("max_pause_sec must be positive and finite")
+        self.cuda = cuda
+        self.duty_cycle = duty_cycle
+        self.clock = clock
+        self.sleep = sleep
+        self.max_pause_sec = max_pause_sec
+        self.started = clock()
+        self.total_sleep_sec = 0.0
+
+    def __call__(self, input_ids: Any, scores: Any, **kwargs: Any) -> bool:
+        if self.duty_cycle >= 1:
+            return False
+        self.cuda.synchronize(0)
+        now = self.clock()
+        active_sec = max(0.0, now - self.started - self.total_sleep_sec)
+        required_sleep = active_sec * (1.0 - self.duty_cycle) / self.duty_cycle
+        pause = min(self.max_pause_sec, max(0.0, required_sleep - self.total_sleep_sec))
+        if pause > 0:
+            self.sleep(pause)
+            self.total_sleep_sec += max(0.0, self.clock() - now)
+        # Never terminate generation or change the schema/JSON stopping rule.
+        return False
+
+
 def _validated_rule_data(rules: list[dict]) -> list[dict[str, str]]:
     if not rules:
         raise RuleValidationError(
@@ -236,15 +276,26 @@ class LocalQwenBackend:
         quantize_4bit: bool = True,
         max_new_tokens: int = 384,
         max_pixels: int = 262144,
+        gpu_duty_cycle: float = 0.75,
+        gpu_memory_fraction: float | None = 0.80,
     ) -> None:
         if max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be positive.")
         if max_pixels < 4 * 32 * 32:
             raise ValueError("max_pixels must be at least 4096.")
+        if (isinstance(gpu_duty_cycle, bool) or not math.isfinite(gpu_duty_cycle)
+                or not 0.1 <= gpu_duty_cycle <= 1):
+            raise ValueError("gpu_duty_cycle must be finite and between 0.1 and 1")
+        if gpu_memory_fraction is not None and (
+                isinstance(gpu_memory_fraction, bool) or not math.isfinite(gpu_memory_fraction)
+                or not 0.1 <= gpu_memory_fraction <= 1):
+            raise ValueError("gpu_memory_fraction must be None or finite and between 0.1 and 1")
         self.model_dir = Path(model_dir)
         self.quantize_4bit = quantize_4bit
         self.max_new_tokens = max_new_tokens
         self.max_pixels = max_pixels
+        self.gpu_duty_cycle = float(gpu_duty_cycle)
+        self.gpu_memory_fraction = (None if gpu_memory_fraction is None else float(gpu_memory_fraction))
         self._model: Any = None
         self._processor: Any = None
         self._torch: Any = None
@@ -297,6 +348,12 @@ class LocalQwenBackend:
             model = Qwen3VLForConditionalGeneration.from_pretrained(
                 str(self.model_dir), **load_options
             ).eval()
+            # Weight loading can temporarily use more allocator memory than
+            # steady inference. Trim that cache before applying the process's
+            # inference limit; this never changes another application's limit.
+            torch.cuda.empty_cache()
+            if self.gpu_memory_fraction is not None:
+                torch.cuda.set_per_process_memory_fraction(self.gpu_memory_fraction, device=0)
         except ModelUnavailableError:
             raise
         except Exception as exc:
@@ -314,6 +371,33 @@ class LocalQwenBackend:
         """Preload weights at worker startup, before accepting timed video jobs."""
         with self._lock:
             self._load_model()
+
+    def _release_unused_memory_unlocked(self) -> None:
+        if self._torch is not None:
+            try:
+                self._torch.cuda.empty_cache()
+            except Exception as exc:
+                log.warning("GPU unused-cache release failed (%s)", type(exc).__name__)
+
+    def release_unused_memory(self) -> None:
+        """Release unused CUDA cache; keep model weights resident for the next job."""
+        with self._lock:
+            self._release_unused_memory_unlocked()
+
+    def _memory_diagnostics(self) -> dict[str, int]:
+        result = {}
+        if self._torch is None:
+            return result
+        for label, method in (("allocated_mib", "memory_allocated"),
+                              ("reserved_mib", "memory_reserved"),
+                              ("peak_allocated_mib", "max_memory_allocated")):
+            try:
+                value = getattr(self._torch.cuda, method)(0)
+                if type(value) is int and value >= 0:
+                    result[label] = round(value / (1024 * 1024))
+            except (AttributeError, RuntimeError):
+                continue
+        return result
 
     def describe(
         self,
@@ -347,6 +431,7 @@ class LocalQwenBackend:
             ])
         with self._lock:
             self._load_model()
+            inputs = generated = answer_tokens = None
             try:
                 text = self._processor.apply_chat_template(
                     [{"role": "user", "content": content}],
@@ -383,6 +468,7 @@ class LocalQwenBackend:
                 # our explicit ordering/whitespace/alphabet before first use.
                 schema_parser.config = parser_config
 
+                pacing = _GpuDutyPacer(self._torch.cuda, self.gpu_duty_cycle)
                 generation_options: dict[str, Any] = {
                     "max_new_tokens": self.max_new_tokens,
                     "do_sample": False,
@@ -390,7 +476,7 @@ class LocalQwenBackend:
                     "stopping_criteria": StoppingCriteriaList([
                         _StopAfterJsonObject(
                             self._processor, inputs["input_ids"].shape[1], self.max_new_tokens,
-                        )
+                        ), pacing,
                     ]),
                 }
                 if timeout_sec is not None:
@@ -413,10 +499,11 @@ class LocalQwenBackend:
                         pass
                 log.info(
                     "local_generation phase=%s nframes=%d generated_tokens=%d complete_json=%s "
-                    "token_limit=%s latency_sec=%.2f",
+                    "token_limit=%s latency_sec=%.2f duty_cycle=%.2f paced_sleep_sec=%.2f gpu_memory=%s",
                     phase, len(frames), generated_token_count, complete_json,
                     generated_token_count >= self.max_new_tokens,
                     time.monotonic() - generation_started,
+                    self.gpu_duty_cycle, pacing.total_sleep_sec, self._memory_diagnostics(),
                 )
                 if len(answers) != 1 or not isinstance(answers[0], str) or not answers[0].strip():
                     raise ModelUnavailableError("The local model returned no usable text.")
@@ -428,6 +515,11 @@ class LocalQwenBackend:
                     "Local model inference failed. Reduce the frame/pixel budget and check GPU memory. "
                     "No verdict was produced."
                 ) from exc
+            finally:
+                # Drop this window's tensors before releasing their allocator
+                # cache. The weights stay loaded; live tensors are never freed.
+                answer_tokens = generated = inputs = None
+                self._release_unused_memory_unlocked()
 
     def close(self) -> None:
         """Release model references without importing or downloading dependencies."""

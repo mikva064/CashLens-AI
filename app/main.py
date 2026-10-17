@@ -153,6 +153,7 @@ def health():
             "analyzer_state": analyzer["status"], "analyzer_error": analyzer["error"],
             "model_name": analyzer["model_name"], "rule_count": analyzer["rule_count"],
             "rules": analyzer["rules"], "limitations": analyzer["limitations"],
+            "performance": analyzer["performance"],
             "web_upload_enabled": WEB_UPLOAD_ENABLED,
             "max_upload_mb": MAX_UPLOAD_MB, "job_timeout_sec": JOB_TIMEOUT_SEC}
 

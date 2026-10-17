@@ -6,10 +6,12 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import av
 from PIL import Image
 
+from cashlens_ai import video
 from cashlens_ai.contracts import Rule, RuleSource
 from cashlens_ai.errors import (
     AnalysisTimeoutError,
@@ -197,8 +199,12 @@ class PipelineTests(unittest.TestCase):
         config = replace(self.config, refine_radius_sec=0.3,
                          refine_fps=20, max_refine_frames=4)
         backend = RecordingBackend(detect)
-        result = VideoAnalyzer(backend, [self.rule], config=config).analyze(
-            self.video, self.root / "job")
+        with patch("cashlens_ai.video._sample", wraps=video._sample) as convert:
+            result = VideoAnalyzer(backend, [self.rule], config=config).analyze(
+                self.video, self.root / "job")
+        fine_conversions = [call for call in convert.call_args_list
+                            if call.args[2] == config.refine_max_edge]
+        self.assertLessEqual(len(fine_conversions), config.max_refine_frames)
         self.assertEqual(result.verdict, "no_violation")
         self.assertEqual(result.violations, [])
         fine_calls = [call for call in backend.calls if call["phase"] == "fine"]

@@ -11,7 +11,7 @@ from pydantic import Field, ValidationError
 
 from .contracts import AnalysisResult, EvidenceFrame, Rule, StrictModel, Violation
 from .errors import AnalysisTimeoutError, InvalidModelOutputError, RuleValidationError, VideoReadError
-from .video import SampledFrame, get_frame_at, iter_sampled_frames, probe_video
+from .video import SampledFrame, get_frame_at, get_frames_at, iter_sampled_frames, probe_video
 
 
 class ModelEvent(StrictModel):
@@ -188,30 +188,26 @@ class VideoAnalyzer:
             # the candidate, including service/transaction boundaries.
             start = max(0.0, first_sec - config.refine_radius_sec)
             end = min(info.duration_sec, last_sec + config.refine_radius_sec)
-            frames = list(iter_sampled_frames(info.path, fps=config.refine_fps,
-                          max_edge=config.refine_max_edge, start_sec=start, end_sec=end))
+            # Choose target times before RGB conversion: do not materialize an
+            # entire high-resolution 3-fps window just to discard most images.
+            required = sorted({first_sec, event.timecode_sec, last_sec})
+            grid_count = max(1, math.ceil((end - start) * config.refine_fps - 1e-9))
+            optional = [start + index / config.refine_fps for index in range(grid_count)
+                        if all(abs(start + index / config.refine_fps - anchor) > 1e-9
+                               for anchor in required)]
+            slots = config.max_refine_frames - len(required)
+            if len(optional) > slots:
+                if slots == 1:
+                    optional = [optional[len(optional) // 2]]
+                elif slots > 1:
+                    last_index = len(optional) - 1
+                    optional = [optional[round(index * last_index / (slots - 1))]
+                                for index in range(slots)]
+                else:
+                    optional = []
+            frames = get_frames_at(info.path, [*required, *optional], max_edge=config.refine_max_edge)
             if not frames:
                 raise InvalidModelOutputError("Cannot verify the proposed event window")
-            # A different sampling grid (and its half-open end) can omit an
-            # original endpoint or the candidate itself. Reserve all three
-            # source frames at fine size before capping the context.
-            context_anchors = [get_frame_at(info.path, timestamp, max_edge=config.refine_max_edge)
-                               for timestamp in (first_sec, event.timecode_sec, last_sec)]
-            required_times = {frame.timestamp_sec for frame in context_anchors}
-            frames = sorted({frame.timestamp_sec: frame for frame in [*frames, *context_anchors]}.values(),
-                            key=lambda frame: frame.timestamp_sec)
-            if len(frames) > config.max_refine_frames:
-                required = [frame for frame in frames if frame.timestamp_sec in required_times]
-                optional = [frame for frame in frames if frame.timestamp_sec not in required_times]
-                slots = config.max_refine_frames - len(required)
-                if slots == 1:
-                    selected = [optional[len(optional) // 2]]
-                elif slots > 1:
-                    last = len(optional) - 1
-                    selected = [optional[round(i * last / (slots - 1))] for i in range(slots)]
-                else:
-                    selected = []
-                frames = sorted([*required, *selected], key=lambda frame: frame.timestamp_sec)
             confirmed.extend(analyze_window(frames, [self.rules[event.rule_id]], "fine"))
 
         violations = []
