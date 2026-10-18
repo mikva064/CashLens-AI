@@ -121,7 +121,7 @@ function renderCoverage(health) {
   const observationTypes = Array.isArray(health.observation_types) ? health.observation_types : [];
   ruleTitles = new Map(rules.map((rule) => [rule.id, rule.title || rule.id]));
   renderStats();
-  $("checks-title").textContent = `Что проверяет сервис · правил: ${rules.length} · типов эпизодов: ${observationTypes.length}`;
+  $("checks-title").textContent = "Что проверяет сервис";
   $("limitations").textContent = typeof health.limitations === "string" && health.limitations
     ? health.limitations
     : "Сервис ищет видимые признаки по подключённым правилам. Результат требует проверки специалистом и не является окончательным юридическим заключением.";
@@ -130,7 +130,7 @@ function renderCoverage(health) {
   if (!rules.length) {
     const empty = document.createElement("li");
     empty.className = "muted";
-    empty.textContent = "Правила пока не загружены. Анализ возможен после подготовки модели и реестра правил.";
+    empty.textContent = "Правила анализа пока недоступны.";
     list.append(empty);
   }
   rules.forEach((rule) => {
@@ -208,22 +208,11 @@ async function refreshStats() {
   }
 }
 
-function renderPerformance(health) {
-  const info = health.performance;
-  const visible = health.analyzer === "model" && info && typeof info.profile === "string";
-  $("performance").hidden = !visible;
-  $("performance-note").hidden = !visible;
-  if (!visible) return;
-  const profile = info.profile === "balanced" ? "сбалансированный" : "детальные кадры";
-  const duty = Math.round(Number(info.gpu_duty_cycle) * 100);
-  const memory = Math.round(Number(info.gpu_memory_fraction) * 100);
-  $("performance").textContent = `Профиль: ${profile} · целевая доля работы GPU: ${duty}% · лимит памяти PyTorch: ${memory}%`;
-  $("performance-note").textContent = (duty < 100
-    ? "Между вычислениями есть паузы; краткие пики GPU до 100% возможны. "
-    : "Дополнительные паузы GPU отключены; загрузка может достигать 100%. ")
-    + (info.profile === "balanced"
-      ? `Уменьшенные кадры и выборка до ${info.max_refine_frames} кадров на уточнение могут пропустить мелкие объекты и короткие действия.`
-      : "Более крупные кадры требуют больше памяти и времени; качество распознавания всё равно требует проверки.");
+function renderPerformance() {
+  for (const id of ["performance", "performance-note"]) {
+    $(id).hidden = true;
+    $(id).textContent = "";
+  }
 }
 
 async function refreshHealth() {
@@ -235,25 +224,25 @@ async function refreshHealth() {
     mode.hidden = false;
     mode.classList.toggle("live", ready && analyzerName === "model");
     mode.textContent = analyzerName === "mock" ? "Демо-режим"
-      : ready ? "Модель работает локально" : "Модель не готова";
+      : ready ? "Локальная обработка" : "Сервис не готов";
     const banner = $("model-status");
     if (ready && analyzerName === "mock") {
       banner.className = "model-status mock";
       banner.textContent = "ДЕМО-РЕЖИМ: результат создаёт заглушка. Содержимое видео не анализируется.";
     } else if (ready) {
       banner.className = "model-status ready";
-      banner.textContent = "Локальная модель готова к анализу";
+      banner.textContent = "Сервис готов к анализу";
     } else if (health.analyzer_state === "failed" || health.analyzer_error) {
       banner.className = "model-status failed";
-      banner.textContent = `Модель не готова: ${health.analyzer_error || "не удалось загрузить модель"}`;
+      banner.textContent = `Сервис не готов: ${health.analyzer_error || "повторите попытку позже"}`;
     } else if (health.analyzer_state === "stopped") {
       banner.className = "model-status failed";
-      banner.textContent = "Анализатор остановлен. Для работы требуется перезапуск локального сервиса.";
+      banner.textContent = "Сервис остановлен. Перезапустите приложение.";
     } else {
       banner.className = "model-status loading";
-      banner.textContent = "Подготавливаем локальную модель… После загрузки станет доступен выбор видео.";
+      banner.textContent = "Подготавливаем сервис… Скоро можно будет загрузить видео.";
     }
-    $("model-name").textContent = health.model_name ? `Модель: ${health.model_name}` : "";
+    $("model-name").textContent = "";
     renderPerformance(health);
     renderCoverage(health);
   } catch {
@@ -261,7 +250,7 @@ async function refreshHealth() {
     $("mode").classList.remove("live");
     $("mode").textContent = "Нет связи с сервисом";
     $("model-status").className = "model-status failed";
-    $("model-status").textContent = "Нет связи с локальным сервисом. Проверка подключения продолжится автоматически.";
+    $("model-status").textContent = "Нет связи с сервисом. Повторяем подключение…";
   } finally {
     syncControls();
     setTimeout(refreshHealth, ready ? 15000 : 4000);
@@ -434,17 +423,17 @@ function updateDownload(job) {
     ? new URL(`/media/${job.job_id}/result.json`, window.location.origin).href : null;
   if (artifactUrl && artifactUrl === expectedUrl) {
     $("download").href = artifactUrl;
-    $("download").textContent = validSha256(job.result_sha256) ? "Скачать JSON" : "Скачать JSON (без SHA-256)";
+    $("download").textContent = "Скачать отчёт (JSON)";
     $("download-note").textContent = validSha256(job.result_sha256)
-      ? "Скачивается сохранённый результат анализа. Его SHA-256 указан в печатном отчёте; отметки проверяющих хранятся отдельно."
-      : "Для сохранённого результата SHA-256 недоступен.";
+      ? ""
+      : "Контрольная сумма отчёта недоступна.";
     return;
   }
   const blob = new Blob([JSON.stringify(job, null, 2)], { type: "application/json" });
   downloadUrl = URL.createObjectURL(blob);
   $("download").href = downloadUrl;
-  $("download").textContent = "Экспорт ответа (без SHA-256)";
-  $("download-note").textContent = "Архивный JSON этой проверки недоступен. Экспортируется текущий ответ сервиса; он не является сохранённым результатом с проверяемым SHA-256.";
+  $("download").textContent = "Экспортировать результат";
+  $("download-note").textContent = "Архивный файл недоступен. Будет экспортирован текущий результат.";
 }
 
 function render(job) {
@@ -460,7 +449,8 @@ function render(job) {
   $("demo").hidden = job.analyzer !== "mock";
   $("result-model").textContent = job.analyzer === "mock"
     ? "Демонстрационный результат. Модель не анализировала видео."
-    : `Видео обработано локальной моделью${$("model-name").textContent ? ` · ${$("model-name").textContent}` : ""}`;
+    : "";
+  $("result-model").hidden = job.analyzer !== "mock";
 
   const verdict = $("verdict");
   verdict.classList.toggle("clear", !found && !reviewRequired);
@@ -522,8 +512,27 @@ function render(job) {
     small.textContent = `.${formatted.split(".")[1]}`;
     tc.replaceChildren(formatted.split(".")[0], small);
     tc.onclick = () => seek(ev.timecode_sec);
+    node.querySelector(".event-category-label").textContent = observation
+      ? "Предполагаемая категория эпизода" : "Признак по нормативному правилу";
     node.querySelector(".event-type").textContent = ev.type;
     node.querySelector(".event-desc").textContent = ev.description;
+    const commentaryLabels = {
+      generated: "Автоматическое описание эпизода",
+      uncertain: "Описание требует проверки",
+      unavailable: "Описание эпизода недоступно",
+    };
+    const hasCommentaryStatus = Object.prototype.hasOwnProperty.call(commentaryLabels, ev.commentary_status);
+    node.querySelector(".event-description-label").textContent = hasCommentaryStatus
+      ? commentaryLabels[ev.commentary_status] : "Критерий выбранной категории";
+    if (hasCommentaryStatus) {
+      const category = node.querySelector(".category-description");
+      category.hidden = false;
+      node.querySelector(".category-description-text").textContent = ev.category_description || ev.type;
+    } else {
+      const notice = node.querySelector(".commentary-notice");
+      notice.hidden = false;
+      notice.textContent = "Описание эпизода недоступно.";
+    }
 
     const frames = node.querySelector(".frames");
     (Array.isArray(ev.evidence_frames) ? ev.evidence_frames : []).forEach((frame) => {

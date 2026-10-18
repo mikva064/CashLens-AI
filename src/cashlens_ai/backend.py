@@ -464,6 +464,12 @@ class LocalQwenBackend:
         with self._lock:
             self._release_unused_memory_unlocked()
 
+    def comment_event(self, frames: Sequence[SampledFrame], *, timeout_sec: float) -> dict[str, str]:
+        """Describe an event's visible action independently of its detected rule."""
+        from .commentary import comment_event
+
+        return comment_event(self, frames, timeout_sec=timeout_sec)
+
     def _memory_diagnostics(self) -> dict[str, int]:
         result = {}
         if self._torch is None:

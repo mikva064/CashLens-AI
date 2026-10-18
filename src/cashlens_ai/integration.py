@@ -33,8 +33,12 @@ def to_api_payload(result: AnalysisResult, *, job_id: str, evidence_root: str | 
             frames.append({"timestamp_sec": evidence.timestamp_sec,
                            "image_base64": base64.b64encode(path.read_bytes()).decode("ascii")})
         citation = f"Основание: {event.source.document}, {event.source.section}. {event.source.url}"
+        prefix = {"generated": "Описание локальной модели по кадрам: ",
+                  "uncertain": "Локальная модель не смогла уверенно описать эпизод. ",
+                  "unavailable": "Описание эпизода недоступно. ",
+                  "legacy_template": "Критерий выбранной категории (шаблон): "}.get(event.commentary_status, "")
         violations.append({"type": event.type, "timecode_sec": event.timecode_sec,
-                           "description": event.description + "\n" + citation,
+                           "description": prefix + event.description + "\n" + citation,
                            "evidence_frames": frames})
     return {"job_id": job_id, "status": "done", "verdict": result.verdict,
             "violations": violations}

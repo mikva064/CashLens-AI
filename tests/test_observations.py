@@ -109,7 +109,9 @@ def test_pipeline_batches_candidates_and_separates_review_from_qualified_events(
     assert result.verdict == ("violation" if mode == "mixed" else "requires_review")
     assert len(result.observations) == 1
     assert result.observations[0].observation_id == definition.id
-    assert result.observations[0].description == definition.description_template
+    assert result.observations[0].category_description == definition.description_template
+    assert result.observations[0].commentary_status == "unavailable"
+    assert result.observations[0].description != definition.description_template
     assert "source" not in result.observations[0].model_dump()
     assert all(frame.image_path.is_file() for frame in result.observations[0].evidence_frames)
     assert len([call for call in backend.calls if call["phase"] == "fine"]) == 1

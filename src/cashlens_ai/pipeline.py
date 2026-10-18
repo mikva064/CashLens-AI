@@ -1,6 +1,7 @@
 """Coarse-to-fine local analysis with validated rule IDs and source evidence."""
 
 import json
+import logging
 import math
 import time
 from dataclasses import dataclass
@@ -9,11 +10,25 @@ from typing import Callable, Protocol, Sequence
 
 from pydantic import Field, StrictFloat, ValidationError
 
-from .contracts import (AnalysisResult, EvidenceFrame, Observation, ObservationDefinition,
+from .contracts import (AnalysisResult, EventCommentary, EvidenceFrame, Observation, ObservationDefinition,
                         Rule, StrictModel, Violation)
 from .observations import category_description
 from .errors import AnalysisTimeoutError, InvalidModelOutputError, RuleValidationError, VideoReadError
 from .video import SampledFrame, get_frames_at, iter_sampled_frames, probe_video
+
+log = logging.getLogger("cashlens.pipeline")
+COMMENTARY_RESERVE_SEC = 5.0
+MIN_COMMENTARY_SEC = 3.0
+
+
+def unavailable_commentary(timecode_sec: float, proof: Sequence[float]) -> str:
+    """Describe available timing evidence without inventing a visible action."""
+    def stamp(value):
+        minutes, seconds = divmod(value, 60)
+        return f"{int(minutes):02d}:{seconds:06.3f}"
+    frames = " → ".join(stamp(value) for value in proof)
+    return (f"Эпизод в {stamp(timecode_sec)}; кадры проверки: {frames}. "
+            "Индивидуальное описание по кадрам не получено; требуется просмотр эпизода.")
 
 
 class ModelEvent(StrictModel):
@@ -48,6 +63,8 @@ class AnalyzerConfig:
     refine_max_edge: int = 896
     merge_sec: float = 2.0
     time_budget_sec: float = 240.0
+    commentary_budget_sec: float = 30.0
+    commentary_timeout_sec: float = 15.0
 
     def __post_init__(self):
         for name in ("sample_fps", "window_sec", "refine_radius_sec", "refine_fps",
@@ -59,6 +76,10 @@ class AnalyzerConfig:
             raise ValueError("overlap_sec must be between zero and window_sec")
         if not math.isfinite(self.merge_sec) or self.merge_sec < 0:
             raise ValueError("merge_sec must be finite and nonnegative")
+        if not math.isfinite(self.commentary_budget_sec) or self.commentary_budget_sec < 0:
+            raise ValueError("commentary_budget_sec must be finite and nonnegative")
+        if not math.isfinite(self.commentary_timeout_sec) or self.commentary_timeout_sec <= 0:
+            raise ValueError("commentary_timeout_sec must be positive and finite")
         if self.max_edge < 32 or self.refine_max_edge < 32 or self.max_refine_frames < 3:
             raise ValueError("Both max_edge values >= 32 and max_refine_frames >= 3 are required")
 
@@ -256,6 +277,7 @@ class VideoAnalyzer:
                                             candidates=context_candidates))
 
         violations, observations = [], []
+        commentary_spent = 0.0
         for index, event in enumerate(merge_events(confirmed, config.merge_sec), 1):
             remaining()
             definition = self.categories[event.rule_id]
@@ -268,8 +290,33 @@ class VideoAnalyzer:
                 path = output / f"event_{index:03d}_{len(evidence) + 1}.jpg"
                 frame.image.save(path, format="JPEG", quality=92)
                 evidence.append(EvidenceFrame(timestamp_sec=frame.timestamp_sec, image_path=path))
+            description = unavailable_commentary(event.timecode_sec, event.evidence_timestamps_sec)
+            commentary_status = "unavailable"
+            comment_event = getattr(self.backend, "comment_event", None)
+            caption_timeout = min(config.commentary_timeout_sec,
+                                  config.commentary_budget_sec - commentary_spent,
+                                  remaining() - COMMENTARY_RESERVE_SEC)
+            if callable(comment_event) and caption_timeout >= MIN_COMMENTARY_SEC:
+                caption_started = self.clock()
+                try:
+                    # Do not supply a category or its template: the caption must
+                    # describe only this event's actual before/action/after frames.
+                    caption = EventCommentary.model_validate(
+                        comment_event(proof_frames, timeout_sec=caption_timeout), strict=True)
+                    commentary_status = caption.status
+                    if caption.status == "generated":
+                        description = caption.text
+                except Exception as exc:
+                    # A caption is optional; it cannot change a detected event
+                    # or leak a model response through an exception traceback.
+                    log.info("event_commentary unavailable error_type=%s", type(exc).__name__)
+                finally:
+                    commentary_spent += max(0.0, self.clock() - caption_started)
+            remaining()
             common = {"type": definition.title, "timecode_sec": event.timecode_sec,
-                      "description": category_description(definition), "evidence_frames": evidence}
+                      "description": description, "evidence_frames": evidence,
+                      "commentary_status": commentary_status,
+                      "category_description": category_description(definition)}
             if event.rule_id in self.rules:
                 violations.append(Violation(**common, rule_id=definition.id, source=definition.source))
             else:

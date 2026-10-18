@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>CashLens — проверка кассы по видео</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v=product-v1">
 </head>
 <body>
   <header class="top">
@@ -24,8 +24,8 @@
       </p>
 
       <div class="model-panel">
-        <p id="model-status" class="model-status loading" role="status">Проверяем готовность модели…</p>
-        <p id="model-name" class="muted"></p>
+        <p id="model-status" class="model-status loading" role="status">Подготавливаем сервис…</p>
+        <p id="model-name" class="muted" hidden></p>
         <p id="performance" class="muted" hidden></p>
         <p id="performance-note" class="muted" hidden></p>
       </div>
@@ -68,7 +68,7 @@
         <p class="verdict-title" id="verdict-title"></p>
         <p class="verdict-meta" id="verdict-meta"></p>
       </div>
-      <p id="result-model" class="muted"></p>
+      <p id="result-model" class="muted" hidden></p>
 
       <div class="layout">
         <aside class="viewer">
@@ -123,7 +123,7 @@
           <h3 id="stats-title">Отметки проверяющих</h3>
           <p id="stats-status" class="muted" role="status">Загружаем отметки…</p>
           <ul id="stats-rules" class="rules"></ul>
-          <p class="muted">Это оценки срабатываний по нормативным правилам, а не измеренная точность модели. Наблюдаемые эпизоды и проверки без срабатываний здесь не учитываются.</p>
+          <p class="muted">Решения специалистов по рассмотренным эпизодам с нормативными признаками.</p>
         </div>
       </details>
     </section>
@@ -140,11 +140,21 @@
     <article class="event">
       <header class="event-head">
         <button class="timecode" type="button" title="Перейти к моменту в видео"></button>
-        <h2 class="event-type"></h2>
+        <div class="event-category">
+          <p class="event-category-label"></p>
+          <h2 class="event-type"></h2>
+        </div>
       </header>
+      <p class="event-description-label"></p>
       <p class="event-desc"></p>
+      <p class="commentary-notice" hidden></p>
+      <div class="category-description" hidden>
+        <p class="category-description-label">Критерий категории</p>
+        <p class="category-description-text"></p>
+      </div>
       <div class="observation-review" hidden>
         <span class="review-badge">Требует проверки</span>
+        <p class="review-reason-label">Что требуется проверить</p>
         <p class="review-reason"></p>
       </div>
       <div class="frames"></div>
@@ -171,6 +181,6 @@
     <p id="zoom-cap"></p>
   </dialog>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=product-v1"></script>
 </body>
 </html>

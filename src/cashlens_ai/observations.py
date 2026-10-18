@@ -8,7 +8,7 @@ from pydantic import TypeAdapter
 from .contracts import ObservationDefinition, Rule
 from .errors import RuleValidationError
 
-PIPELINE_REVISION = "observable-catalog-v2"
+PIPELINE_REVISION = "observable-catalog-v3"
 _RULE_DESCRIPTIONS = {
     "cashier_leaves_during_service": "Во время продолжающегося приёма наличных работник покидает своё рабочее место.",
     "prior_receipt_cash_exposed": "При следующем приёме наличных ранее принятая партия остаётся открыто на рабочей поверхности.",

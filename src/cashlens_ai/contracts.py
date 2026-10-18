@@ -36,6 +36,22 @@ class EvidenceFrame(StrictModel):
     image_path: Path
 
 
+CommentaryStatus = Literal["generated", "uncertain", "unavailable", "legacy_template"]
+
+
+class EventCommentary(StrictModel):
+    status: Literal["generated", "uncertain"]
+    text: str = Field(max_length=80)
+
+    @model_validator(mode="after")
+    def text_matches_status(self):
+        if self.status == "generated" and len(self.text) < 8:
+            raise ValueError("Generated commentary requires a meaningful nonempty caption")
+        if self.status == "uncertain" and self.text:
+            raise ValueError("Uncertain commentary must not assert a scene caption")
+        return self
+
+
 class Violation(StrictModel):
     type: str = Field(min_length=1)
     timecode_sec: float = Field(ge=0)
@@ -43,6 +59,8 @@ class Violation(StrictModel):
     rule_id: str
     source: RuleSource
     evidence_frames: list[EvidenceFrame] = Field(min_length=1, max_length=3)
+    commentary_status: CommentaryStatus = "legacy_template"
+    category_description: str | None = Field(default=None, min_length=1, max_length=1000)
 
 
 class ObservationDefinition(StrictModel):
@@ -60,6 +78,8 @@ class Observation(StrictModel):
     description: str = Field(min_length=1)
     evidence_frames: list[EvidenceFrame] = Field(min_length=1, max_length=3)
     review_reason: str = Field(min_length=10)
+    commentary_status: CommentaryStatus = "legacy_template"
+    category_description: str | None = Field(default=None, min_length=1, max_length=1000)
 
 
 class AnalysisResult(StrictModel):

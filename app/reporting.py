@@ -6,6 +6,14 @@ from pathlib import Path
 from cashlens_ai.contracts import AnalysisResult
 
 
+def _commentary_fields(event) -> dict:
+    """Project narrative provenance without changing archived JSON artifacts."""
+    status = event.commentary_status
+    return {"commentary_status": status,
+            "category_description": event.category_description or (
+                event.description if status == "legacy_template" else event.type)}
+
+
 def web_result(job: dict, jobs_dir: Path) -> dict:
     stored = job["result"]
     result = AnalysisResult.model_validate(stored["analysis"])
@@ -19,7 +27,8 @@ def web_result(job: dict, jobs_dir: Path) -> dict:
                            "url": f"/media/{job['id']}/{relative.as_posix()}"})
         item = {"type": event.type, "timecode_sec": event.timecode_sec,
                 "description": event.description, "rule_id": event.rule_id,
-                "source": event.source.model_dump(mode="json"), "evidence_frames": frames}
+                "source": event.source.model_dump(mode="json"), "evidence_frames": frames,
+                **_commentary_fields(event)}
         filename = f"event_{index + 1:03d}.mp4"
         clip = stored.get("clips", {}).get(str(index))
         if clip and clip.get("filename") == filename and (job_dir / "clips" / filename).is_file():
@@ -34,7 +43,8 @@ def web_result(job: dict, jobs_dir: Path) -> dict:
                            "url": f"/media/{job['id']}/{relative.as_posix()}"})
         item = {"observation_id": event.observation_id, "type": event.type,
                 "timecode_sec": event.timecode_sec, "description": event.description,
-                "review_reason": event.review_reason, "evidence_frames": frames}
+                "review_reason": event.review_reason, "evidence_frames": frames,
+                **_commentary_fields(event)}
         filename = f"observation_{index + 1:03d}.mp4"
         clip = stored.get("observation_clips", {}).get(str(index))
         if clip and clip.get("filename") == filename and (job_dir / "clips" / filename).is_file():

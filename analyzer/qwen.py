@@ -75,6 +75,8 @@ class QwenAnalyzer:
             max_edge=int(os.getenv("CASHLENS_MAX_EDGE", str(defaults["max_edge"]))),
             refine_max_edge=int(os.getenv("CASHLENS_REFINE_MAX_EDGE", str(defaults["refine_max_edge"]))),
             max_refine_frames=int(os.getenv("CASHLENS_MAX_REFINE_FRAMES", str(defaults["max_refine_frames"]))),
+            commentary_budget_sec=float(os.getenv("CASHLENS_COMMENTARY_BUDGET_SEC", "30")),
+            commentary_timeout_sec=float(os.getenv("CASHLENS_COMMENTARY_TIMEOUT_SEC", "15")),
         )
         max_pixels = int(os.getenv("CASHLENS_MAX_PIXELS", str(defaults["max_pixels"])))
         gpu_duty_cycle = float(os.getenv("CASHLENS_GPU_DUTY_CYCLE", "0.75"))
@@ -97,6 +99,8 @@ class QwenAnalyzer:
                 "max_edge": config.max_edge, "refine_max_edge": config.refine_max_edge,
                 "max_refine_frames": config.max_refine_frames, "max_pixels": max_pixels,
                 "gpu_duty_cycle": gpu_duty_cycle, "gpu_memory_fraction": gpu_memory_fraction,
+                "commentary_budget_sec": config.commentary_budget_sec,
+                "commentary_timeout_sec": config.commentary_timeout_sec,
             }
         except Exception:
             self.close()

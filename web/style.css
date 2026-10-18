@@ -250,6 +250,7 @@ video {
 .event.observation .timecode { color: var(--review); }
 .observation-review { margin: 10px 0 16px; padding: 12px 14px; border-left: 3px solid var(--review); background: var(--review-soft); }
 .review-badge { font-weight: 600; color: #664000; }
+.review-reason-label { margin: 10px 0 0; font-size: 13px; font-weight: 600; }
 .review-reason { margin: 6px 0 0; font-size: 14px; }
 .event + .event { padding-top: 28px; border-top: 1px solid var(--line); }
 .event-head { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
@@ -268,7 +269,15 @@ video {
 .timecode:hover { text-decoration-color: currentColor; }
 .timecode small { font-size: .45em; font-weight: 600; letter-spacing: 0; }
 .event-type { margin: 0; font-size: 20px; line-height: 1.3; font-weight: 600; }
-.event-desc { margin: 12px 0 16px; max-width: 64ch; }
+.event-category { flex: 1 1 250px; }
+.event-category-label, .event-description-label, .category-description-label {
+  margin: 0 0 4px; color: var(--slate); font-size: 13px; font-weight: 600;
+}
+.event-description-label { margin-top: 16px; }
+.event-desc { margin: 0 0 12px; max-width: 64ch; white-space: pre-line; overflow-wrap: anywhere; }
+.commentary-notice { margin: 0 0 16px; max-width: 64ch; color: var(--slate); font-size: 13px; }
+.category-description { margin: 0 0 16px; padding-left: 12px; border-left: 2px solid var(--line); max-width: 64ch; }
+.category-description-text { margin: 0; font-size: 14px; overflow-wrap: anywhere; }
 
 .frames { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 4px; }
 .frames figure { margin: 0; flex: 0 0 auto; }
@@ -383,6 +392,9 @@ video {
   .event { break-inside: avoid; padding: 10pt 0; }
   .findings-title { font-size: 12pt; margin-bottom: 8pt; }
   .observation-review { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .event-category-label, .event-description-label, .category-description-label, .commentary-notice { color: #444; }
+  .event-description-label { margin-top: 7pt; }
+  .event-desc, .category-description { margin-bottom: 7pt; }
   .event + .event { padding-top: 10pt; }
   .timecode { font-size: 26pt; }
   .frames { overflow: visible; }
